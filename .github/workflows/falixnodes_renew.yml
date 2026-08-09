@@ -45,7 +45,7 @@ jobs:
           xvfb-run --server-args="-screen 0 1280x1024x24" node index.js
 
       - name: Send Telegram Notification
-        if: always() # 确保即使脚本意外中断，依然尝试推送已有截图
+        if: always() # 无论脚本成功与否，均执行此步发送通知
         run: |
           if [ -n "${{ secrets.TG_BOT_TOKEN }}" ] && [ -n "${{ secrets.TG_CHAT_ID }}" ]; then
             # 读取初始时间状态，如未获取成功则标为未知
@@ -54,39 +54,19 @@ jobs:
               TIMER_STATUS=$(cat timer_status.txt)
             fi
             
-            # 使用多行文本构建 TG 文字消息
+            # 判断续期流程是否顺利走完（根据最终截图文件是否存在）
+            STATUS_MSG="❌ 续期流程可能异常中断，请登录控制台检查"
+            if [ -f screenshot3_result.png ]; then
+              STATUS_MSG="✅ 续期流程已执行完毕，具体结果请登录控制台确认"
+            fi
+
+            # 采用 printf 格式化换行，避免 YAML 缩进错误
+            TEXT_MSG="🤖 *FalixNodes 自动续期任务运行完毕* 🤖\n\n📍 服务器初始剩余时间: *${TIMER_STATUS}*\n\n📊 运行状态: ${STATUS_MSG}"
+
             curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
               --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" \
               --data-urlencode "parse_mode=Markdown" \
-              --data-urlencode "text=🤖 *FalixNodes 自动续期任务运行完毕* 🤖
-
-📍 服务器初始剩余时间: *${TIMER_STATUS}*
-
-✅ 详细结果请查看后续截图反馈。"
-
-            # 推送截图 1
-            if [ -f screenshot1_cf_login.png ]; then
-              curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendPhoto" \
-                -F "chat_id=${{ secrets.TG_CHAT_ID }}" \
-                -F "photo=@screenshot1_cf_login.png" \
-                -F "caption=截图 1: 登录界面 CF 验证结果"
-            fi
-            
-            # 推送截图 2
-            if [ -f screenshot2_cf_timer.png ]; then
-              curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendPhoto" \
-                -F "chat_id=${{ secrets.TG_CHAT_ID }}" \
-                -F "photo=@screenshot2_cf_timer.png" \
-                -F "caption=截图 2: 计时器页面 CF 验证结果"
-            fi
-            
-            # 推送截图 3
-            if [ -f screenshot3_result.png ]; then
-              curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendPhoto" \
-                -F "chat_id=${{ secrets.TG_CHAT_ID }}" \
-                -F "photo=@screenshot3_result.png" \
-                -F "caption=截图 3: 最终续期结果"
-            fi
+              --data-urlencode "text=$(printf "$TEXT_MSG")"
           else
-            echo "TG_BOT_TOKEN 与 TG_CHAT_ID 未配置，跳过 Telegram 推送步骤。"
+            echo "TG_BOT_TOKEN 与 TG_CHAT_ID 未配置或不完整，跳过推送。"
           fi
