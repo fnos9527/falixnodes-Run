@@ -1,0 +1,92 @@
+name: FalixNodes Auto Renew
+
+on:
+  schedule:
+    # 每天固定在国际标准时间 08:00 (北京时间下午 4:00) 运行一次
+    - cron: '0 8 * * *'
+  workflow_dispatch: # 支持控制台手动点击执行
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install System Dependencies for Puppeteer & Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgbm-dev libasound2 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libpango-1.0-0 libcairo2 unzip wget
+
+      - name: Download Xray Core v25.9.11
+        run: |
+          wget https://github.com/XTLS/Xray-core/releases/download/v25.9.11/Xray-linux-64.zip
+          unzip Xray-linux-64.zip -d xray-bin
+          chmod +x xray-bin/xray
+
+      - name: Install Node Dependencies
+        run: |
+          npm init -y
+          npm install puppeteer-real-browser
+
+      - name: Run Auto Renew Script
+        env:
+          VLESS_LINK: ${{ secrets.VLESS_LINK }}
+          FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+          FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+        run: |
+          # 启动 xvfb 虚拟图形界面服务并开始执行主程序
+          xvfb-run --server-args="-screen 0 1280x1024x24" node index.js
+
+      - name: Send Telegram Notification
+        if: always() # 确保即使脚本意外中断，依然尝试推送已有截图
+        run: |
+          if [ -n "${{ secrets.TG_BOT_TOKEN }}" ] && [ -n "${{ secrets.TG_CHAT_ID }}" ]; then
+            # 读取初始时间状态，如未获取成功则标为未知
+            TIMER_STATUS="未知"
+            if [ -f timer_status.txt ]; then
+              TIMER_STATUS=$(cat timer_status.txt)
+            fi
+            
+            # 使用多行文本构建 TG 文字消息
+            curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+              --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" \
+              --data-urlencode "parse_mode=Markdown" \
+              --data-urlencode "text=🤖 *FalixNodes 自动续期任务运行完毕* 🤖
+
+📍 服务器初始剩余时间: *${TIMER_STATUS}*
+
+✅ 详细结果请查看后续截图反馈。"
+
+            # 推送截图 1
+            if [ -f screenshot1_cf_login.png ]; then
+              curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendPhoto" \
+                -F "chat_id=${{ secrets.TG_CHAT_ID }}" \
+                -F "photo=@screenshot1_cf_login.png" \
+                -F "caption=截图 1: 登录界面 CF 验证结果"
+            fi
+            
+            # 推送截图 2
+            if [ -f screenshot2_cf_timer.png ]; then
+              curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendPhoto" \
+                -F "chat_id=${{ secrets.TG_CHAT_ID }}" \
+                -F "photo=@screenshot2_cf_timer.png" \
+                -F "caption=截图 2: 计时器页面 CF 验证结果"
+            fi
+            
+            # 推送截图 3
+            if [ -f screenshot3_result.png ]; then
+              curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendPhoto" \
+                -F "chat_id=${{ secrets.TG_CHAT_ID }}" \
+                -F "photo=@screenshot3_result.png" \
+                -F "caption=截图 3: 最终续期结果"
+            fi
+          else
+            echo "TG_BOT_TOKEN 与 TG_CHAT_ID 未配置，跳过 Telegram 推送步骤。"
+          fi
