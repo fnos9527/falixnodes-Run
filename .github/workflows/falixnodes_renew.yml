@@ -19,10 +19,11 @@ jobs:
         with:
           node-version: 18
 
+      # 针对 Ubuntu 24.04 精简了依赖包，仅保留 xvfb 虚拟屏幕和下载工具
       - name: Install System Dependencies for Puppeteer & Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libgbm-dev libasound2 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libpango-1.0-0 libcairo2 unzip wget
+          sudo apt-get install -y xvfb unzip wget
 
       - name: Download Xray Core v25.9.11
         run: |
