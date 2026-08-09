@@ -2,9 +2,8 @@ name: FalixNodes Auto Renew
 
 on:
   schedule:
-    # 每天固定在国际标准时间 08:00 (北京时间下午 4:00) 运行一次
     - cron: '0 8 * * *'
-  workflow_dispatch: # 支持控制台手动点击执行
+  workflow_dispatch:
 
 jobs:
   renew:
@@ -19,7 +18,6 @@ jobs:
         with:
           node-version: 18
 
-      # 针对 Ubuntu 24.04 精简了依赖包，仅保留 xvfb 虚拟屏幕和下载工具
       - name: Install System Dependencies for Puppeteer & Xvfb
         run: |
           sudo apt-get update
@@ -42,32 +40,30 @@ jobs:
           FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
           FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
         run: |
-          # 启动 xvfb 虚拟图形界面服务并开始执行主程序
           xvfb-run --server-args="-screen 0 1280x1024x24" node index.js
 
       - name: Send Telegram Notification
-        if: always() # 无论脚本成功与否，均执行此步发送通知
+        if: always()
         run: |
           if [ -n "${{ secrets.TG_BOT_TOKEN }}" ] && [ -n "${{ secrets.TG_CHAT_ID }}" ]; then
-            # 读取初始时间状态，如未获取成功则标为未知
+            # 读取初始时间状态
             TIMER_STATUS="未知"
             if [ -f timer_status.txt ]; then
               TIMER_STATUS=$(cat timer_status.txt)
             fi
             
-            # 判断续期流程是否顺利走完（根据最终截图文件是否存在）
-            STATUS_MSG="❌ 续期流程可能异常中断，请登录控制台检查"
-            if [ -f screenshot3_result.png ]; then
-              STATUS_MSG="✅ 续期流程已执行完毕，具体结果请登录控制台确认"
+            # 读取 Node 脚本中写入的精准状态
+            STATUS_MSG="❌ 流程非正常中断"
+            if [ -f status.txt ]; then
+              STATUS_MSG=$(cat status.txt)
             fi
 
-            # 采用 printf 格式化换行，避免 YAML 缩进错误
-            TEXT_MSG="🤖 *FalixNodes 自动续期任务运行完毕* 🤖\n\n📍 服务器初始剩余时间: *${TIMER_STATUS}*\n\n📊 运行状态: ${STATUS_MSG}"
+            TEXT_MSG="🤖 *FalixNodes 自动续期任务运行完毕* 🤖\n\n📍 服务器初始剩余时间: *${TIMER_STATUS}*\n\n📊 运行状态: *${STATUS_MSG}*"
 
             curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
               --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" \
               --data-urlencode "parse_mode=Markdown" \
               --data-urlencode "text=$(printf "$TEXT_MSG")"
           else
-            echo "TG_BOT_TOKEN 与 TG_CHAT_ID 未配置或不完整，跳过推送。"
+            echo "未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过。"
           fi
