@@ -16,7 +16,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 22
 
       - name: Install System Dependencies for Puppeteer & Xvfb
         run: |
@@ -42,17 +42,25 @@ jobs:
         run: |
           xvfb-run --server-args="-screen 0 1280x1024x24" node index.js
 
+      - name: Upload Screenshots as Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: |
+            screenshot*.png
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Send Telegram Notification
         if: always()
         run: |
           if [ -n "${{ secrets.TG_BOT_TOKEN }}" ] && [ -n "${{ secrets.TG_CHAT_ID }}" ]; then
-            # 读取初始时间状态
             TIMER_STATUS="未知"
             if [ -f timer_status.txt ]; then
               TIMER_STATUS=$(cat timer_status.txt)
             fi
-            
-            # 读取 Node 脚本中写入的精准状态
+
             STATUS_MSG="❌ 流程非正常中断"
             if [ -f status.txt ]; then
               STATUS_MSG=$(cat status.txt)
