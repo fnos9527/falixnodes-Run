@@ -8,12 +8,12 @@ function log(msg) {
 }
 
 fs.writeFileSync('status.txt', '失败: 脚本异常中断');
-log('脚本启动，初始状态已写入。');
+log('脚本启动。');
 
 // ─── 1. 解析 VLESS ────────────────────────────────────────────────────────────
 const vlessLink = process.env.VLESS_LINK;
 if (!vlessLink) {
-    log('错误：未找到 VLESS_LINK 环境变量！');
+    log('错误：未找到 VLESS_LINK！');
     fs.writeFileSync('status.txt', '失败: 未配置 VLESS_LINK');
     process.exit(1);
 }
@@ -24,11 +24,9 @@ function parseVless(vless) {
         let uuid = parsed.username;
         if (!uuid) { const m = vless.match(/vless:\/\/([^@]+)@/); if (m) uuid = m[1]; }
         uuid = decodeURIComponent(uuid || '');
-        const host = parsed.hostname;
-        const port = parseInt(parsed.port) || 443;
+        const host = parsed.hostname, port = parseInt(parsed.port) || 443;
         const params = parsed.searchParams;
-        const type = params.get('type') || 'tcp';
-        const security = params.get('security') || 'none';
+        const type = params.get('type') || 'tcp', security = params.get('security') || 'none';
         const rawSni = params.get('sni'), rawHost = params.get('host');
         const sni = rawSni || rawHost || host;
         const rawInsecure = params.get('insecure') || params.get('allowInsecure') || '';
@@ -85,8 +83,8 @@ let xrayProcess = spawn('./xray-bin/xray', ['-c', 'xray_config.json']);
 xrayProcess.stdout.on('data', d => log(`[Xray] ${d.toString().trim()}`));
 xrayProcess.stderr.on('data', d => log(`[Xray ERR] ${d.toString().trim()}`));
 xrayProcess.on('close', code => log(`Xray 关闭，退出码 ${code}`));
-
 log('等待 3 秒让 Xray 初始化...');
+
 setTimeout(async () => {
     try { await runBrowser(); }
     catch (err) {
@@ -99,121 +97,45 @@ setTimeout(async () => {
     }
 }, 3000);
 
-// ─── 工具：截图 + 打印所有可见按钮 ──────────────────────────────────────────
-async function screenshotWithInfo(page, filename) {
-    await page.screenshot({ path: filename, fullPage: true });
-    const buttons = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('button, [role="button"], a.btn, .btn'))
-            .filter(el => el.offsetParent !== null)
-            .map(el => el.textContent.trim().replace(/\s+/g, ' ').substring(0, 80))
-            .filter(t => t.length > 0)
-    );
-    log(`[截图] ${filename} | 可见按钮: ${JSON.stringify(buttons)}`);
+// ─── 工具：安全截图（超时保护，不抛异常）────────────────────────────────────
+async function safeScreenshot(page, filename, timeout = 15000) {
+    try {
+        await Promise.race([
+            page.screenshot({ path: filename, fullPage: false }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('截图超时')), timeout))
+        ]);
+        const btns = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('button'))
+                .filter(b => b.offsetParent !== null)
+                .map(b => b.textContent.trim().replace(/\s+/g, ' ').substring(0, 60))
+                .filter(t => t)
+        ).catch(() => []);
+        log(`[截图] ${filename} | 可见button: ${JSON.stringify(btns)}`);
+    } catch (e) {
+        log(`[截图跳过] ${filename}: ${e.message}`);
+    }
 }
 
-// ─── 工具：关闭广告 ──────────────────────────────────────────────────────────
+// ─── 工具：关闭固定定位广告横幅 ─────────────────────────────────────────────
 async function dismissAds(page) {
     const n = await page.evaluate(() => {
         let count = 0;
-        // 点击常见关闭按钮
-        ['[class*="close"]','[class*="dismiss"]','[aria-label="close"]','[aria-label="Close"]',
-         'button[class*="close"]','.ad-close','#ad-close'].forEach(sel => {
-            try { document.querySelectorAll(sel).forEach(el => { if (el.offsetParent) { el.click(); count++; } }); } catch(_){}
-        });
-        // 隐藏底部固定广告横幅（排除顶部导航）
         document.querySelectorAll('*').forEach(el => {
             try {
                 const s = window.getComputedStyle(el);
                 if ((s.position === 'fixed' || s.position === 'sticky') && s.display !== 'none') {
                     const r = el.getBoundingClientRect();
-                    if (r.top > 80 && r.height > 20 && r.height < 300) { el.style.display = 'none'; count++; }
+                    // 只隐藏底部广告横幅（顶部 80px 以下，高度小于 200px）
+                    if (r.top > 80 && r.height > 10 && r.height < 200) {
+                        el.style.setProperty('display', 'none', 'important');
+                        count++;
+                    }
                 }
-            } catch(_){}
+            } catch(_) {}
         });
         return count;
-    });
-    if (n > 0) log(`广告处理: 操作了 ${n} 个元素。`);
-}
-
-// ─── 核心：精准点击 Add Time 按钮 ────────────────────────────────────────────
-// 通过检查元素是否在 .card / .timer-card 等容器内，或者是否是 <button> 标签来过滤
-async function clickAddTimeBtn(page) {
-    const result = await page.evaluate(() => {
-        // 策略1：找 href 包含 timer 页面内的 button 标签，文字精确匹配 "+ Add Time" 或 "Add Time"
-        const candidates = Array.from(document.querySelectorAll('button'));
-        for (const btn of candidates) {
-            const text = btn.textContent.trim().replace(/\s+/g, ' ');
-            if ((text === 'Add Time' || text === '+ Add Time') && btn.offsetParent !== null) {
-                btn.scrollIntoView({ block: 'center' });
-                btn.click();
-                return { ok: true, text, tag: 'button' };
-            }
-        }
-        // 策略2：找 <a> 标签，文字精确匹配
-        const links = Array.from(document.querySelectorAll('a'));
-        for (const a of links) {
-            const text = a.textContent.trim().replace(/\s+/g, ' ');
-            if ((text === 'Add Time' || text === '+ Add Time') && a.offsetParent !== null) {
-                a.scrollIntoView({ block: 'center' });
-                a.click();
-                return { ok: true, text, tag: 'a' };
-            }
-        }
-        // 策略3：找 class 含 btn / button 的元素，文字精确匹配
-        const btnLike = Array.from(document.querySelectorAll('[class*="btn"],[class*="button"]'));
-        for (const el of btnLike) {
-            const text = el.textContent.trim().replace(/\s+/g, ' ');
-            if ((text === 'Add Time' || text === '+ Add Time') && el.offsetParent !== null) {
-                el.scrollIntoView({ block: 'center' });
-                el.click();
-                return { ok: true, text, tag: el.tagName };
-            }
-        }
-        // 调试：返回页面上所有 button 标签的文字，帮助排查
-        const allBtns = candidates.filter(b => b.offsetParent !== null)
-            .map(b => b.textContent.trim().replace(/\s+/g, ' ').substring(0, 60));
-        return { ok: false, allBtns };
-    });
-    return result;
-}
-
-// ─── 核心：精准点击 Watch Ad 按钮 ────────────────────────────────────────────
-async function clickWatchAdBtn(page) {
-    const result = await page.evaluate(() => {
-        // Watch Ad 只会出现在弹窗/modal 里，优先找 button 标签
-        const candidates = Array.from(document.querySelectorAll('button'));
-        for (const btn of candidates) {
-            const text = btn.textContent.trim().replace(/\s+/g, ' ');
-            if (text === 'Watch Ad' && btn.offsetParent !== null) {
-                btn.scrollIntoView({ block: 'center' });
-                btn.click();
-                return { ok: true, text, tag: 'button' };
-            }
-        }
-        // 模糊匹配 button
-        for (const btn of candidates) {
-            const text = btn.textContent.trim().replace(/\s+/g, ' ');
-            if (text.includes('Watch Ad') && btn.offsetParent !== null) {
-                btn.scrollIntoView({ block: 'center' });
-                btn.click();
-                return { ok: true, text, tag: 'button' };
-            }
-        }
-        // 找其他标签，精确匹配
-        const all = Array.from(document.querySelectorAll('a, [role="button"], [class*="btn"]'));
-        for (const el of all) {
-            const text = el.textContent.trim().replace(/\s+/g, ' ');
-            if (text === 'Watch Ad' && el.offsetParent !== null) {
-                el.scrollIntoView({ block: 'center' });
-                el.click();
-                return { ok: true, text, tag: el.tagName };
-            }
-        }
-        const allBtns = candidates.filter(b => b.offsetParent !== null)
-            .map(b => b.textContent.trim().replace(/\s+/g, ' ').substring(0, 60));
-        return { ok: false, allBtns };
-    });
-    return result;
+    }).catch(() => 0);
+    if (n > 0) log(`广告处理: 隐藏了 ${n} 个固定定位元素。`);
 }
 
 // ─── 4. 主流程 ───────────────────────────────────────────────────────────────
@@ -222,10 +144,17 @@ async function runBrowser() {
     const { page, browser } = await connect({
         headless: false,
         turnstile: true,
-        args: ['--proxy-server=socks5://127.0.0.1:10808', '--no-sandbox', '--disable-setuid-sandbox', '--window-size=1920,1080'],
+        args: [
+            '--proxy-server=socks5://127.0.0.1:10808',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--window-size=1920,1080',
+        ],
         disableXvfb: false
     });
     await page.setViewport({ width: 1920, height: 1080 });
+    // 提高协议超时上限，避免广告播放期间截图超时
+    page.setDefaultTimeout(120000);
     log('浏览器已启动。');
 
     try {
@@ -234,7 +163,7 @@ async function runBrowser() {
         await page.goto('https://client.falixnodes.net/auth/login', { waitUntil: 'networkidle2', timeout: 60000 });
         log('等待 15 秒 Cloudflare 通过...');
         await new Promise(r => setTimeout(r, 15000));
-        await screenshotWithInfo(page, 'screenshot1_login.png');
+        await safeScreenshot(page, 'screenshot1_login.png');
 
         const emailInput = await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 15000 });
         await emailInput.type(process.env.FALIX_EMAIL);
@@ -263,68 +192,119 @@ async function runBrowser() {
         await new Promise(r => setTimeout(r, 15000));
         await dismissAds(page);
         await new Promise(r => setTimeout(r, 500));
-        await screenshotWithInfo(page, 'screenshot2_timer.png');
+        await safeScreenshot(page, 'screenshot2_timer.png');
 
-        // ── 点击 Add Time（精准版）──
-        log('尝试点击 "Add Time" 按钮（精准匹配 <button> 标签）...');
-        const addResult = await clickAddTimeBtn(page);
+        // ── 点击 Add Time（精准匹配 <button> 标签）──
+        log('尝试点击 "Add Time" 按钮...');
+        const addResult = await page.evaluate(() => {
+            for (const btn of document.querySelectorAll('button')) {
+                const text = btn.textContent.trim().replace(/\s+/g, ' ');
+                if ((text === 'Add Time' || text === '+ Add Time') && btn.offsetParent !== null) {
+                    btn.scrollIntoView({ block: 'center' });
+                    btn.click();
+                    return { ok: true, text };
+                }
+            }
+            const allBtns = Array.from(document.querySelectorAll('button'))
+                .filter(b => b.offsetParent !== null)
+                .map(b => b.textContent.trim().replace(/\s+/g, ' ').substring(0, 60));
+            return { ok: false, allBtns };
+        });
         log(`Add Time 结果: ${JSON.stringify(addResult)}`);
 
         if (!addResult.ok) {
-            log('未找到 "Add Time" 按钮，页面结构可能有变，请查看截图。');
+            log('未找到 "Add Time" 按钮。');
             fs.writeFileSync('status.txt', '失败: 未找到 Add Time 按钮');
-            await screenshotWithInfo(page, 'screenshot3_no_addtime.png');
+            await safeScreenshot(page, 'screenshot3_no_addtime.png');
             return;
         }
 
-        // ── 等待弹窗 ──
-        log('已点击 Add Time，等待 8 秒让广告弹窗加载...');
-        await new Promise(r => setTimeout(r, 8000));
-        await dismissAds(page);
-        await new Promise(r => setTimeout(r, 500));
-        await screenshotWithInfo(page, 'screenshot3_after_addtime.png');
+        // ── 等待弹窗出现（"Watch Ad to Extend Timer" 对话框）──
+        log('已点击 Add Time，等待 Watch Ad 弹窗出现（最多 15 秒）...');
+        let watchAdFound = false;
+        for (let i = 0; i < 15; i++) {
+            await new Promise(r => setTimeout(r, 1000));
+            watchAdFound = await page.evaluate(() => {
+                for (const btn of document.querySelectorAll('button')) {
+                    const text = btn.textContent.trim().replace(/\s+/g, ' ');
+                    if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) return true;
+                }
+                return false;
+            });
+            if (watchAdFound) { log(`Watch Ad 按钮在第 ${i+1} 秒出现！`); break; }
+            log(`等待弹窗... ${i+1}/15`);
+        }
 
-        // ── 点击 Watch Ad（精准版）──
-        log('尝试点击 "Watch Ad" 按钮...');
-        const watchResult = await clickWatchAdBtn(page);
-        log(`Watch Ad 结果: ${JSON.stringify(watchResult)}`);
-
-        if (!watchResult.ok) {
-            log('未出现 "Watch Ad" 按钮，剩余时间可能已满（>70小时），无需续期。');
+        if (!watchAdFound) {
+            log('15 秒内未出现 Watch Ad 按钮，剩余时间可能已满（>70小时），无需续期。');
             fs.writeFileSync('status.txt', '无需续期: Watch Ad 按钮未出现（剩余时间已接近上限）');
-            await screenshotWithInfo(page, 'screenshot4_result.png');
+            await safeScreenshot(page, 'screenshot3_result.png');
             return;
         }
 
-        // ── 轮询检测续期结果 ──
-        log('Watch Ad 已点击，轮询等待续期结果（最多 120 秒）...');
+        await safeScreenshot(page, 'screenshot3_watch_ad_dialog.png');
+
+        // ── 点击 Watch Ad ──
+        log('点击 Watch Ad 按钮...');
+        await page.evaluate(() => {
+            for (const btn of document.querySelectorAll('button')) {
+                const text = btn.textContent.trim().replace(/\s+/g, ' ');
+                if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) {
+                    btn.scrollIntoView({ block: 'center' });
+                    btn.click();
+                    return;
+                }
+            }
+        });
+        log('Watch Ad 已点击，广告加载中...');
+
+        // ── 等待广告播放完毕并跳转回主页 ──
+        // 流程：点击 Watch Ad → 广告全屏播放 → 播完自动跳回 client.falixnodes.net
+        // 策略：轮询检查 URL 是否跳回主页，或页面出现 "Timer has been extended"
+        log('等待广告播放完毕并跳转（最多 180 秒）...');
         let success = false;
-        for (let i = 0; i < 12; i++) {
-            log(`轮询 ${i + 1}/12，等待 10 秒...`);
-            await new Promise(r => setTimeout(r, 10000));
-            const bodyText = await page.evaluate(() => document.body.innerText);
-            if (bodyText.includes('Timer has been extended') || bodyText.includes('extended') || bodyText.includes('Success')) {
-                log('检测到续期成功关键字！');
+        for (let i = 0; i < 36; i++) {
+            await new Promise(r => setTimeout(r, 5000));
+            const currentUrl = page.url();
+            log(`第 ${i+1}/36 次检查，当前 URL: ${currentUrl}`);
+
+            // 检查是否已跳回主页并出现成功提示
+            const pageText = await page.evaluate(() => document.body.innerText).catch(() => '');
+            if (pageText.includes('Timer has been extended') || pageText.includes('extended')) {
+                log('检测到 "Timer has been extended" 成功提示！');
                 success = true;
                 break;
             }
-            log('暂未检测到成功关键字，继续...');
+
+            // 如果 URL 已跳回主页（不再是广告页），再多等 5 秒让成功提示渲染
+            if (currentUrl.includes('client.falixnodes.net') && !currentUrl.includes('#go')) {
+                log('URL 已跳回主页，再等 5 秒让提示渲染...');
+                await new Promise(r => setTimeout(r, 5000));
+                const finalText = await page.evaluate(() => document.body.innerText).catch(() => '');
+                if (finalText.includes('Timer has been extended') || finalText.includes('extended')) {
+                    log('检测到续期成功！');
+                    success = true;
+                }
+                break;
+            }
         }
 
         if (success) {
             log('续期成功！');
             fs.writeFileSync('status.txt', '✅ 续期成功: 时间已成功延长');
         } else {
-            log('轮询结束，未检测到时间延长。');
-            fs.writeFileSync('status.txt', '❌ 续期失败: 广告播放完毕后未检测到时间延长');
+            log('等待超时，未检测到时间延长提示。');
+            fs.writeFileSync('status.txt', '❌ 续期失败: 广告播放后未检测到成功跳转');
         }
-        await screenshotWithInfo(page, 'screenshot4_result.png');
+
+        // 最终截图（不截广告页，等跳回主页后再截）
+        await safeScreenshot(page, 'screenshot4_result.png');
 
     } catch (e) {
         log(`异常: ${e.message}`);
         console.error(e.stack);
         fs.writeFileSync('status.txt', `失败: 运行异常 (${e.message})`);
-        try { await page.screenshot({ path: 'screenshot_error.png', fullPage: true }); } catch (_) {}
+        await safeScreenshot(page, 'screenshot_error.png');
     } finally {
         log('关闭浏览器...');
         await browser.close();
