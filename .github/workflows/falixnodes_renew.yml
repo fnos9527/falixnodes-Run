@@ -40,7 +40,8 @@ jobs:
           FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
           FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
         run: |
-          xvfb-run --server-args="-screen 0 1280x1024x24" node index.js
+          # 使用 1920x1080 分辨率启动虚拟显示器
+          xvfb-run --server-args="-screen 0 1920x1080x24" node index.js
 
       - name: Upload Screenshots as Artifacts
         if: always()
