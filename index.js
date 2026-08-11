@@ -2,6 +2,8 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const { connect } = require('puppeteer-real-browser');
 
+const TIMER_URL = 'https://client.falixnodes.net/timer?id=2845100';
+
 function log(msg) {
     const ts = new Date().toISOString();
     console.log(`[${ts}] ${msg}`);
@@ -138,6 +140,107 @@ async function dismissAds(page) {
     if (n > 0) log(`广告处理: 隐藏了 ${n} 个固定定位元素。`);
 }
 
+// ─── 工具：等待 Cloudflare 人机验证通过（固定等待，配合 turnstile:true 自动过验证）──
+async function waitForCloudflare(page, ms = 15000) {
+    log(`等待 ${ms / 1000} 秒让 Cloudflare 验证通过...`);
+    await new Promise(r => setTimeout(r, ms));
+}
+
+// ─── 工具：将 "X hours Y minutes Z seconds" 解析为总秒数，便于前后对比 ──────
+function parseRemainingTime(text) {
+    const full = text.match(/(\d+)\s*hours?\s*(\d+)\s*minutes?\s*(\d+)\s*seconds?/i);
+    if (full) {
+        const [, h, m, s] = full;
+        return { raw: full[0], totalSeconds: (+h) * 3600 + (+m) * 60 + (+s) };
+    }
+    const short = text.match(/(\d+)\s*hours?\s*(\d+)\s*minutes?/i) || text.match(/(\d+)\s*h\s*(\d+)\s*m/i);
+    if (short) {
+        const [, h, m] = short;
+        return { raw: short[0], totalSeconds: (+h) * 3600 + (+m) * 60 };
+    }
+    return { raw: '未捕获到具体剩余时间', totalSeconds: null };
+}
+
+// ─── 工具：打开 Timer 页并读取当前剩余时间（登录后可反复调用）─────────────────
+async function readTimerPage(page, screenshotName) {
+    log(`导航到 Timer 页: ${TIMER_URL}`);
+    await page.goto(TIMER_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+    log('Timer 页加载完成，等待 Cloudflare 验证...');
+    await waitForCloudflare(page, 15000);
+    await dismissAds(page);
+    await new Promise(r => setTimeout(r, 500));
+    if (screenshotName) await safeScreenshot(page, screenshotName);
+
+    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+    const timeInfo = parseRemainingTime(bodyText);
+    log(`剩余时间: ${timeInfo.raw} (总秒数: ${timeInfo.totalSeconds})`);
+    return timeInfo;
+}
+
+// ─── 工具：点击 "+ Add Time" 按钮 ────────────────────────────────────────────
+async function clickAddTime(page) {
+    log('尝试点击 "Add Time" 按钮...');
+    const result = await page.evaluate(() => {
+        for (const btn of document.querySelectorAll('button')) {
+            const text = btn.textContent.trim().replace(/\s+/g, ' ');
+            if ((text === 'Add Time' || text === '+ Add Time') && btn.offsetParent !== null) {
+                btn.scrollIntoView({ block: 'center' });
+                btn.click();
+                return { ok: true, text };
+            }
+        }
+        const allBtns = Array.from(document.querySelectorAll('button'))
+            .filter(b => b.offsetParent !== null)
+            .map(b => b.textContent.trim().replace(/\s+/g, ' ').substring(0, 60));
+        return { ok: false, allBtns };
+    });
+    log(`Add Time 结果: ${JSON.stringify(result)}`);
+    return result;
+}
+
+// ─── 工具：等待 "Watch Ad to Extend Timer" 弹窗中的 Watch Ad 按钮出现 ────────
+async function waitForWatchAdButton(page, maxSeconds = 15) {
+    log(`等待 Watch Ad 弹窗出现（最多 ${maxSeconds} 秒）...`);
+    for (let i = 0; i < maxSeconds; i++) {
+        const found = await page.evaluate(() => {
+            for (const btn of document.querySelectorAll('button')) {
+                const text = btn.textContent.trim().replace(/\s+/g, ' ');
+                if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) return true;
+            }
+            return false;
+        });
+        if (found) { log(`Watch Ad 按钮在第 ${i + 1} 秒出现。`); return true; }
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    log(`${maxSeconds} 秒内未出现 Watch Ad 按钮。`);
+    return false;
+}
+
+// ─── 工具：点击 Watch Ad 按钮 ────────────────────────────────────────────────
+async function clickWatchAd(page) {
+    log('点击 Watch Ad 按钮...');
+    await page.evaluate(() => {
+        for (const btn of document.querySelectorAll('button')) {
+            const text = btn.textContent.trim().replace(/\s+/g, ' ');
+            if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) {
+                btn.scrollIntoView({ block: 'center' });
+                btn.click();
+                return;
+            }
+        }
+    });
+    log('Watch Ad 已点击，广告开始播放。');
+}
+
+// ─── 工具：写入本次续期结果，供 Telegram 通知步骤读取 ────────────────────────
+function writeRenewResult({ beforeRaw, afterRaw, statusText }) {
+    fs.writeFileSync('time_before.txt', beforeRaw || 'N/A');
+    fs.writeFileSync('time_after.txt', afterRaw || 'N/A');
+    fs.writeFileSync('status.txt', statusText);
+    // 兼容旧字段
+    fs.writeFileSync('timer_status.txt', beforeRaw || 'N/A');
+}
+
 // ─── 4. 主流程 ───────────────────────────────────────────────────────────────
 async function runBrowser() {
     log('启动浏览器（1920×1080）...');
@@ -153,7 +256,6 @@ async function runBrowser() {
         disableXvfb: false
     });
     await page.setViewport({ width: 1920, height: 1080 });
-    // 提高协议超时上限，避免广告播放期间截图超时
     page.setDefaultTimeout(120000);
     log('浏览器已启动。');
 
@@ -161,8 +263,7 @@ async function runBrowser() {
         // ── 登录 ──
         log('导航到登录页...');
         await page.goto('https://client.falixnodes.net/auth/login', { waitUntil: 'networkidle2', timeout: 60000 });
-        log('等待 15 秒 Cloudflare 通过...');
-        await new Promise(r => setTimeout(r, 15000));
+        await waitForCloudflare(page, 15000);
         await safeScreenshot(page, 'screenshot1_login.png');
 
         const emailInput = await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 15000 });
@@ -175,135 +276,67 @@ async function runBrowser() {
         await new Promise(r => setTimeout(r, 10000));
         log('当前 URL: ' + page.url());
 
-        // ── Timer 页 ──
-        log('导航到 Timer 页...');
-        await page.goto('https://client.falixnodes.net/timer?id=2845100', { waitUntil: 'networkidle2', timeout: 60000 });
-        log('Timer 页加载完成。');
+        // ── 第一步：打开 Timer 页，读取续期前剩余时间 ──
+        const before = await readTimerPage(page, 'screenshot2_timer_before.png');
 
-        const remainingTimeText = await page.evaluate(() => {
-            const text = document.body.innerText;
-            const match = text.match(/(\d+)\s*hours?\s*(\d+)\s*minutes?/i) || text.match(/(\d+)\s*h\s*(\d+)\s*m/i);
-            return match ? match[0] : '未捕获到具体剩余时间';
-        });
-        log(`剩余时间: ${remainingTimeText}`);
-        fs.writeFileSync('timer_status.txt', remainingTimeText);
-
-        log('等待 15 秒让页面渲染完成...');
-        await new Promise(r => setTimeout(r, 15000));
-        await dismissAds(page);
-        await new Promise(r => setTimeout(r, 500));
-        await safeScreenshot(page, 'screenshot2_timer.png');
-
-        // ── 点击 Add Time（精准匹配 <button> 标签）──
-        log('尝试点击 "Add Time" 按钮...');
-        const addResult = await page.evaluate(() => {
-            for (const btn of document.querySelectorAll('button')) {
-                const text = btn.textContent.trim().replace(/\s+/g, ' ');
-                if ((text === 'Add Time' || text === '+ Add Time') && btn.offsetParent !== null) {
-                    btn.scrollIntoView({ block: 'center' });
-                    btn.click();
-                    return { ok: true, text };
-                }
-            }
-            const allBtns = Array.from(document.querySelectorAll('button'))
-                .filter(b => b.offsetParent !== null)
-                .map(b => b.textContent.trim().replace(/\s+/g, ' ').substring(0, 60));
-            return { ok: false, allBtns };
-        });
-        log(`Add Time 结果: ${JSON.stringify(addResult)}`);
-
+        // ── 第二步：点击 "+ Add Time" ──
+        const addResult = await clickAddTime(page);
         if (!addResult.ok) {
-            log('未找到 "Add Time" 按钮。');
-            fs.writeFileSync('status.txt', '失败: 未找到 Add Time 按钮');
+            log('未找到 "Add Time" 按钮，终止本次续期。');
             await safeScreenshot(page, 'screenshot3_no_addtime.png');
-            return;
-        }
-
-        // ── 等待弹窗出现（"Watch Ad to Extend Timer" 对话框）──
-        log('已点击 Add Time，等待 Watch Ad 弹窗出现（最多 15 秒）...');
-        let watchAdFound = false;
-        for (let i = 0; i < 15; i++) {
-            await new Promise(r => setTimeout(r, 1000));
-            watchAdFound = await page.evaluate(() => {
-                for (const btn of document.querySelectorAll('button')) {
-                    const text = btn.textContent.trim().replace(/\s+/g, ' ');
-                    if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) return true;
-                }
-                return false;
+            writeRenewResult({
+                beforeRaw: before.raw,
+                afterRaw: 'N/A',
+                statusText: '❌ 续期失败: 未找到 Add Time 按钮'
             });
-            if (watchAdFound) { log(`Watch Ad 按钮在第 ${i+1} 秒出现！`); break; }
-            log(`等待弹窗... ${i+1}/15`);
-        }
-
-        if (!watchAdFound) {
-            log('15 秒内未出现 Watch Ad 按钮，剩余时间可能已满（>70小时），无需续期。');
-            fs.writeFileSync('status.txt', '无需续期: Watch Ad 按钮未出现（剩余时间已接近上限）');
-            await safeScreenshot(page, 'screenshot3_result.png');
             return;
         }
 
+        // ── 第三步：等待 "Watch Ad to Extend Timer" 弹窗 ──
+        const dialogShown = await waitForWatchAdButton(page, 15);
+        if (!dialogShown) {
+            log('未出现 Watch Ad 弹窗，可能剩余时间已接近上限，无需续期。');
+            await safeScreenshot(page, 'screenshot3_no_dialog.png');
+            writeRenewResult({
+                beforeRaw: before.raw,
+                afterRaw: before.raw,
+                statusText: '⚠️ 无需续期: 未出现 Watch Ad 弹窗（剩余时间可能已接近上限）'
+            });
+            return;
+        }
         await safeScreenshot(page, 'screenshot3_watch_ad_dialog.png');
 
-        // ── 点击 Watch Ad ──
-        log('点击 Watch Ad 按钮...');
-        await page.evaluate(() => {
-            for (const btn of document.querySelectorAll('button')) {
-                const text = btn.textContent.trim().replace(/\s+/g, ' ');
-                if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) {
-                    btn.scrollIntoView({ block: 'center' });
-                    btn.click();
-                    return;
-                }
-            }
-        });
-        log('Watch Ad 已点击，广告加载中...');
+        // ── 第四步：点击 Watch Ad，播放广告，最多等待 30 秒 ──
+        await clickWatchAd(page);
+        log('等待广告播放，最多 30 秒...');
+        await new Promise(r => setTimeout(r, 30000));
+        await safeScreenshot(page, 'screenshot4_after_ad.png');
 
-        // ── 等待广告播放完毕并跳转回主页 ──
-        // 流程：点击 Watch Ad → 广告全屏播放 → 播完自动跳回 client.falixnodes.net
-        // 策略：轮询检查 URL 是否跳回主页，或页面出现 "Timer has been extended"
-        log('等待广告播放完毕并跳转（最多 180 秒）...');
-        let success = false;
-        for (let i = 0; i < 36; i++) {
-            await new Promise(r => setTimeout(r, 5000));
-            const currentUrl = page.url();
-            log(`第 ${i+1}/36 次检查，当前 URL: ${currentUrl}`);
+        // ── 第五步：重新回到 Timer 页，读取续期后剩余时间 ──
+        const after = await readTimerPage(page, 'screenshot5_timer_after.png');
 
-            // 检查是否已跳回主页并出现成功提示
-            const pageText = await page.evaluate(() => document.body.innerText).catch(() => '');
-            if (pageText.includes('Timer has been extended') || pageText.includes('extended')) {
-                log('检测到 "Timer has been extended" 成功提示！');
-                success = true;
-                break;
-            }
-
-            // 如果 URL 已跳回主页（不再是广告页），再多等 5 秒让成功提示渲染
-            if (currentUrl.includes('client.falixnodes.net') && !currentUrl.includes('#go')) {
-                log('URL 已跳回主页，再等 5 秒让提示渲染...');
-                await new Promise(r => setTimeout(r, 5000));
-                const finalText = await page.evaluate(() => document.body.innerText).catch(() => '');
-                if (finalText.includes('Timer has been extended') || finalText.includes('extended')) {
-                    log('检测到续期成功！');
-                    success = true;
-                }
-                break;
-            }
-        }
-
-        if (success) {
-            log('续期成功！');
-            fs.writeFileSync('status.txt', '✅ 续期成功: 时间已成功延长');
+        // ── 第六步：对比前后时间，判断续期是否成功 ──
+        let statusText;
+        if (before.totalSeconds === null || after.totalSeconds === null) {
+            statusText = '⚠️ 无法判断: 未能正确解析剩余时间文本，请查看截图确认';
+        } else if (after.totalSeconds > before.totalSeconds) {
+            log(`续期成功！剩余时间从 ${before.raw} 增加到 ${after.raw}`);
+            statusText = '✅ 续期成功: 剩余时间已增加';
         } else {
-            log('等待超时，未检测到时间延长提示。');
-            fs.writeFileSync('status.txt', '❌ 续期失败: 广告播放后未检测到成功跳转');
+            log(`续期失败，剩余时间未增加（续期前: ${before.raw}，续期后: ${after.raw}）`);
+            statusText = '❌ 续期失败: 观看广告后剩余时间未增加';
         }
 
-        // 最终截图（不截广告页，等跳回主页后再截）
-        await safeScreenshot(page, 'screenshot4_result.png');
+        writeRenewResult({ beforeRaw: before.raw, afterRaw: after.raw, statusText });
 
     } catch (e) {
         log(`异常: ${e.message}`);
         console.error(e.stack);
-        fs.writeFileSync('status.txt', `失败: 运行异常 (${e.message})`);
+        writeRenewResult({
+            beforeRaw: fs.existsSync('time_before.txt') ? fs.readFileSync('time_before.txt', 'utf8') : 'N/A',
+            afterRaw: 'N/A',
+            statusText: `❌ 续期失败: 运行异常 (${e.message})`
+        });
         await safeScreenshot(page, 'screenshot_error.png');
     } finally {
         log('关闭浏览器...');
