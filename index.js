@@ -146,6 +146,28 @@ async function waitForCloudflare(page, ms = 15000) {
     await new Promise(r => setTimeout(r, ms));
 }
 
+// ─── 工具：容错版 page.evaluate ──────────────────────────────────────────────
+// 点击按钮后页面可能会发生一次跳转/刷新，此时 evaluate 会抛出
+// "Execution context was destroyed, most likely because of a navigation."
+// 这类错误本质是"页面正在跳转，稍等即可"，不代表操作失败，因此这里做自动重试。
+async function safeEvaluate(page, fn, { retries = 5, retryDelay = 1000, fallback = null, label = 'evaluate' } = {}) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await page.evaluate(fn);
+        } catch (e) {
+            const isNavError = /Execution context was destroyed|context was destroyed|detached Frame|Target closed|Cannot find context/i.test(e.message);
+            if (isNavError && attempt < retries) {
+                log(`[${label}] 页面正在跳转导致执行上下文失效，${retryDelay}ms 后重试 (${attempt + 1}/${retries})...`);
+                await new Promise(r => setTimeout(r, retryDelay));
+                continue;
+            }
+            log(`[${label}] evaluate 失败: ${e.message}`);
+            return fallback;
+        }
+    }
+    return fallback;
+}
+
 // ─── 工具：将 "X hours Y minutes Z seconds" 解析为总秒数，便于前后对比 ──────
 function parseRemainingTime(text) {
     const full = text.match(/(\d+)\s*hours?\s*(\d+)\s*minutes?\s*(\d+)\s*seconds?/i);
@@ -171,7 +193,7 @@ async function readTimerPage(page, screenshotName) {
     await new Promise(r => setTimeout(r, 500));
     if (screenshotName) await safeScreenshot(page, screenshotName);
 
-    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+    const bodyText = await safeEvaluate(page, () => document.body.innerText, { label: 'readTimerPage', fallback: '' });
     const timeInfo = parseRemainingTime(bodyText);
     log(`剩余时间: ${timeInfo.raw} (总秒数: ${timeInfo.totalSeconds})`);
     return timeInfo;
@@ -180,7 +202,7 @@ async function readTimerPage(page, screenshotName) {
 // ─── 工具：点击 "+ Add Time" 按钮 ────────────────────────────────────────────
 async function clickAddTime(page) {
     log('尝试点击 "Add Time" 按钮...');
-    const result = await page.evaluate(() => {
+    const result = await safeEvaluate(page, () => {
         for (const btn of document.querySelectorAll('button')) {
             const text = btn.textContent.trim().replace(/\s+/g, ' ');
             if ((text === 'Add Time' || text === '+ Add Time') && btn.offsetParent !== null) {
@@ -193,7 +215,7 @@ async function clickAddTime(page) {
             .filter(b => b.offsetParent !== null)
             .map(b => b.textContent.trim().replace(/\s+/g, ' ').substring(0, 60));
         return { ok: false, allBtns };
-    });
+    }, { label: 'clickAddTime', fallback: { ok: false, allBtns: [] } });
     log(`Add Time 结果: ${JSON.stringify(result)}`);
     return result;
 }
@@ -202,13 +224,13 @@ async function clickAddTime(page) {
 async function waitForWatchAdButton(page, maxSeconds = 15) {
     log(`等待 Watch Ad 弹窗出现（最多 ${maxSeconds} 秒）...`);
     for (let i = 0; i < maxSeconds; i++) {
-        const found = await page.evaluate(() => {
+        const found = await safeEvaluate(page, () => {
             for (const btn of document.querySelectorAll('button')) {
                 const text = btn.textContent.trim().replace(/\s+/g, ' ');
                 if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) return true;
             }
             return false;
-        });
+        }, { label: 'waitForWatchAdButton', retries: 2, fallback: false });
         if (found) { log(`Watch Ad 按钮在第 ${i + 1} 秒出现。`); return true; }
         await new Promise(r => setTimeout(r, 1000));
     }
@@ -219,16 +241,17 @@ async function waitForWatchAdButton(page, maxSeconds = 15) {
 // ─── 工具：点击 Watch Ad 按钮 ────────────────────────────────────────────────
 async function clickWatchAd(page) {
     log('点击 Watch Ad 按钮...');
-    await page.evaluate(() => {
+    await safeEvaluate(page, () => {
         for (const btn of document.querySelectorAll('button')) {
             const text = btn.textContent.trim().replace(/\s+/g, ' ');
             if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) {
                 btn.scrollIntoView({ block: 'center' });
                 btn.click();
-                return;
+                return true;
             }
         }
-    });
+        return false;
+    }, { label: 'clickWatchAd', fallback: false });
     log('Watch Ad 已点击，广告开始播放。');
 }
 
@@ -278,6 +301,8 @@ async function runBrowser() {
 
         // ── 第一步：打开 Timer 页，读取续期前剩余时间 ──
         const before = await readTimerPage(page, 'screenshot2_timer_before.png');
+        // 立刻写盘：即使后面步骤异常中断，通知里也能看到真实的续期前时间
+        fs.writeFileSync('time_before.txt', before.raw || 'N/A');
 
         // ── 第二步：点击 "+ Add Time" ──
         const addResult = await clickAddTime(page);
@@ -292,8 +317,12 @@ async function runBrowser() {
             return;
         }
 
+        // 点击后页面可能触发一次跳转/刷新（新版页面常见），先缓冲等待，
+        // 避免紧接着的 evaluate 恰好撞在导航中途。
+        await new Promise(r => setTimeout(r, 2000));
+
         // ── 第三步：等待 "Watch Ad to Extend Timer" 弹窗 ──
-        const dialogShown = await waitForWatchAdButton(page, 15);
+        const dialogShown = await waitForWatchAdButton(page, 20);
         if (!dialogShown) {
             log('未出现 Watch Ad 弹窗，可能剩余时间已接近上限，无需续期。');
             await safeScreenshot(page, 'screenshot3_no_dialog.png');
