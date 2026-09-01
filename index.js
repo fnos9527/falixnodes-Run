@@ -147,9 +147,6 @@ async function waitForCloudflare(page, ms = 15000) {
 }
 
 // ─── 工具：容错版 page.evaluate ──────────────────────────────────────────────
-// 点击按钮后页面可能会发生一次跳转/刷新，此时 evaluate 会抛出
-// "Execution context was destroyed, most likely because of a navigation."
-// 这类错误本质是"页面正在跳转，稍等即可"，不代表操作失败，因此这里做自动重试。
 async function safeEvaluate(page, fn, { retries = 5, retryDelay = 1000, fallback = null, label = 'evaluate' } = {}) {
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
@@ -266,21 +263,41 @@ function writeRenewResult({ beforeRaw, afterRaw, statusText }) {
 
 // ─── 4. 主流程 ───────────────────────────────────────────────────────────────
 async function runBrowser() {
-    log('启动浏览器（1920×1080）...');
-    const { page, browser } = await connect({
-        headless: false,
-        turnstile: true,
-        args: [
-            '--proxy-server=socks5://127.0.0.1:10808',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--window-size=1920,1080',
-        ],
-        disableXvfb: false
-    });
+    log('准备启动浏览器...');
+    
+    let browser, page;
+    let launchRetries = 3; // 设置浏览器启动重试次数
+    
+    for (let i = 0; i < launchRetries; i++) {
+        try {
+            log(`尝试启动浏览器 (第 ${i + 1}/${launchRetries} 次)...`);
+            const browserData = await connect({
+                headless: false,
+                turnstile: true,
+                args: [
+                    '--proxy-server=socks5://127.0.0.1:10808',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',    // 【修复1】至关重要！解决 GitHub Actions 中内存溢出导致的崩溃
+                    '--disable-gpu',              // 禁用 GPU 加速，提高 CI 环境稳定性
+                    '--disable-software-rasterizer',
+                    '--window-size=1920,1080',
+                ],
+                disableXvfb: false
+            });
+            browser = browserData.browser;
+            page = browserData.page;
+            break; // 成功启动，跳出循环
+        } catch (err) {
+            log(`浏览器启动失败: ${err.message}`);
+            if (i === launchRetries - 1) throw new Error('浏览器启动重试达到上限，放弃。');
+            await new Promise(r => setTimeout(r, 5000)); // 等待 5 秒后重试
+        }
+    }
+
     await page.setViewport({ width: 1920, height: 1080 });
     page.setDefaultTimeout(120000);
-    log('浏览器已启动。');
+    log('浏览器已成功启动。');
 
     try {
         // ── 登录 ──
@@ -317,14 +334,15 @@ async function runBrowser() {
             return;
         }
 
-        // 点击后页面可能触发一次跳转/刷新（新版页面常见），先缓冲等待，
-        // 避免紧接着的 evaluate 恰好撞在导航中途。
-        await new Promise(r => setTimeout(r, 2000));
+        // 【修复2】点击 Add Time 后极大概率触发 Cloudflare 二次验证，等待盾通过
+        log('Add Time 点击完毕，缓冲等待并检查是否有 Cloudflare 二次拦截...');
+        await new Promise(r => setTimeout(r, 3000));
+        await waitForCloudflare(page, 10000); // 再次等待 CF 盾过去
 
         // ── 第三步：等待 "Watch Ad to Extend Timer" 弹窗 ──
         const dialogShown = await waitForWatchAdButton(page, 20);
         if (!dialogShown) {
-            log('未出现 Watch Ad 弹窗，可能剩余时间已接近上限，无需续期。');
+            log('未出现 Watch Ad 弹窗，可能剩余时间已接近上限，或者被防机器拦截。');
             await safeScreenshot(page, 'screenshot3_no_dialog.png');
             writeRenewResult({
                 beforeRaw: before.raw,
@@ -366,9 +384,9 @@ async function runBrowser() {
             afterRaw: 'N/A',
             statusText: `❌ 续期失败: 运行异常 (${e.message})`
         });
-        await safeScreenshot(page, 'screenshot_error.png');
+        if (page) await safeScreenshot(page, 'screenshot_error.png');
     } finally {
         log('关闭浏览器...');
-        await browser.close();
+        if (browser) await browser.close();
     }
 }
