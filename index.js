@@ -208,9 +208,7 @@ async function typeAndVerify(page, selector, text, name) {
         await el.type(text, { delay: 50 });
         await new Promise(r => setTimeout(r, 500));
         
-        // 读取输入框实际内容进行二次校验
         const val = await page.evaluate(node => node.value, el);
-        
         if (val === text) {
             log(`[验证成功] ${name} 已正确填入。`);
             return true;
@@ -263,7 +261,7 @@ async function waitForWatchAdButton(page, maxSeconds = 15) {
         const found = await safeEvaluate(page, () => {
             for (const btn of document.querySelectorAll('button')) {
                 const text = btn.textContent.trim().replace(/\s+/g, ' ');
-                if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) return true;
+                if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad') || text.includes('Watch Video'))) return true;
             }
             return false;
         }, { label: 'waitForWatchAdButton', retries: 2, fallback: false });
@@ -275,10 +273,10 @@ async function waitForWatchAdButton(page, maxSeconds = 15) {
 
 async function clickWatchAd(page) {
     log('点击 Watch Ad 按钮...');
-    await safeEvaluate(page, () => {
+    const clicked = await safeEvaluate(page, () => {
         for (const btn of document.querySelectorAll('button')) {
             const text = btn.textContent.trim().replace(/\s+/g, ' ');
-            if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad'))) {
+            if (btn.offsetParent !== null && (text === 'Watch Ad' || text.includes('Watch Ad') || text.includes('Watch Video'))) {
                 btn.scrollIntoView({ block: 'center' });
                 btn.click();
                 return true;
@@ -286,6 +284,79 @@ async function clickWatchAd(page) {
         }
         return false;
     }, { label: 'clickWatchAd', fallback: false });
+    if(clicked) log('Watch Ad 已点击，广告开始请求。');
+    else log('警告：未找到 Watch Ad 按钮！');
+}
+
+// ─── 工具：智能广告监控并自动点击 Close ──────────────────────────────────────
+async function handleAdPlayback(page) {
+    log('▶️ 开始智能监控广告状态，寻找关闭按钮，最多等待 90 秒...');
+    let adClosed = false;
+    let maxWaitSeconds = 90; 
+    let checkInterval = 3000;
+
+    for (let i = 0; i < maxWaitSeconds / (checkInterval / 1000); i++) {
+        let clicked = false;
+        
+        // 遍历所有 iframe（包含主页面），寻找跨域的广告弹窗
+        for (const frame of page.frames()) {
+            try {
+                clicked = await frame.evaluate(() => {
+                    // 1. 根据文字特征寻找关闭/跳过按钮
+                    const els = Array.from(document.querySelectorAll('button, div, span, a'));
+                    for (const el of els) {
+                        const rect = el.getBoundingClientRect();
+                        // 必须是可见的元素，且避免巨大的容器 div
+                        if (rect.width === 0 || rect.height === 0 || el.children.length > 2) continue;
+
+                        const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        const validTexts = ['close', 'close ad', 'skip', 'skip ad', 'x', '×', 'reward granted, close ad', '关闭', '跳过'];
+                        
+                        if (validTexts.includes(text)) {
+                            el.scrollIntoView({ block: 'center' });
+                            el.click();
+                            return true;
+                        }
+                    }
+                    
+                    // 2. 特殊情况：部分广告关闭按钮是没文字的图片/SVG
+                    const icons = Array.from(document.querySelectorAll('svg, i, img'));
+                    for (const icon of icons) {
+                        const className = (icon.getAttribute('class') || '').toLowerCase();
+                        const id = (icon.getAttribute('id') || '').toLowerCase();
+                        if ((className.includes('close') || id.includes('close')) && !className.includes('container')) {
+                            const rect = icon.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                icon.scrollIntoView({ block: 'center' });
+                                if (icon.parentElement) icon.parentElement.click();
+                                else icon.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                });
+                if (clicked) break;
+            } catch(e) { } // 忽略无权访问的跨域 iframe 异常
+        }
+
+        if (clicked) {
+            adClosed = true;
+            log('✅ 成功找到了关闭/跳过广告的按钮并已点击！等待 8 秒让回调数据传回服务器...');
+            await new Promise(r => setTimeout(r, 8000));
+            break; // 点击完成，退出监控循环
+        }
+
+        if (i > 0 && i % 5 === 0) {
+            log(`⏳ 广告正在播放/监控中... 已经等待 ${i * (checkInterval/1000)} 秒`);
+            await safeScreenshot(page, `screenshot_ad_monitor_${i * (checkInterval/1000)}s.png`);
+        }
+        await new Promise(r => setTimeout(r, checkInterval));
+    }
+
+    if (!adClosed) {
+        log('⚠️ 90秒超时仍未找到关闭按钮，广告可能已自动关闭，或本次广告无法被自动识别。');
+    }
 }
 
 function writeRenewResult({ beforeRaw, afterRaw, statusText }) {
@@ -341,7 +412,6 @@ async function runBrowser() {
         await safeScreenshot(page, 'screenshot1_login_before.png');
 
         log('开始强制校验输入账号密码...');
-        // 使用 typeAndVerify 确保绝不漏字
         await typeAndVerify(page, 'input[name="identifier"], input[type="email"], input[name="email"]', falixEmail, '账号 (Email)');
         await typeAndVerify(page, 'input[name="password"], input[type="password"]', falixPassword, '密码 (Password)');
         
@@ -349,22 +419,18 @@ async function runBrowser() {
         await new Promise(r => setTimeout(r, 5000));
         await safeScreenshot(page, 'screenshot1_login_filled.png');
 
-        // 【修复点2】双重提交策略：先尝试敲击回车
         log('尝试按 Enter 键提交表单...');
         await page.keyboard.press('Enter');
         
         log('等待 5 秒检查是否发生跳转...');
         await new Promise(r => setTimeout(r, 5000));
 
-        // 如果按回车没起效还在登录页，尝试用鼠标坐标点击蓝色的大按钮
         if (page.url().includes('/auth/login')) {
             log('按 Enter 后仍未跳转，尝试精确点击 Sign In 按钮...');
             const btnRect = await page.evaluate(() => {
                 const btns = Array.from(document.querySelectorAll('button'));
                 let target = btns.find(b => typeof b.className === 'string' && b.className.includes('cl-formButtonPrimary'));
-                if (!target) {
-                    target = btns.find(b => b.textContent.trim() === 'Sign In' && b.offsetParent !== null);
-                }
+                if (!target) target = btns.find(b => b.textContent.trim() === 'Sign In' && b.offsetParent !== null);
                 if (target && !target.disabled) {
                     target.scrollIntoView({ block: 'center' });
                     const rect = target.getBoundingClientRect();
@@ -376,16 +442,11 @@ async function runBrowser() {
                 await page.mouse.click(btnRect.x, btnRect.y);
                 log('已精确点击坐标位置，等待 10 秒...');
                 await new Promise(r => setTimeout(r, 10000));
-            } else {
-                log('未能找到可点击的 Sign In 按钮坐标。');
             }
         }
         
-        const currentUrl = page.url();
-        log('当前 URL: ' + currentUrl);
-        if (currentUrl.includes('/auth/login')) {
+        if (page.url().includes('/auth/login')) {
             log('⚠️ 警告：当前仍然在登录页，表单可能提交失败！');
-            await safeScreenshot(page, 'screenshot1_login_failed.png');
         }
 
         // ── 第一步：打开 Timer 页，读取续期前剩余时间 ──
@@ -405,9 +466,23 @@ async function runBrowser() {
             return;
         }
 
-        log('Add Time 点击完毕，缓冲等待并检查是否有 Cloudflare 二次拦截...');
-        await new Promise(r => setTimeout(r, 3000));
-        await waitForCloudflare(page, 10000);
+        log('Add Time 点击完毕，缓冲等待 5 秒检查是否有页面跳转拦截...');
+        await new Promise(r => setTimeout(r, 5000));
+        await waitForCloudflare(page, 5000);
+
+        // 拦截机制：如果跳转去了容器页面，说明时间已满
+        const currentUrlAfterAdd = page.url();
+        if (!currentUrlAfterAdd.includes('/timer')) {
+            log(`⚠️ 页面从 Timer 跳转到了 ${currentUrlAfterAdd}`);
+            log('这通常意味着时间已达服务器设定的最大上限，面板自动阻断了广告请求。');
+            await safeScreenshot(page, 'screenshot3_redirected_to_server.png');
+            writeRenewResult({
+                beforeRaw: before.raw,
+                afterRaw: before.raw,
+                statusText: '✅ 续期完成: 返回了主面板界面 (时间可能已达最大上限)'
+            });
+            return;
+        }
 
         // ── 第三步：等待 "Watch Ad to Extend Timer" 弹窗 ──
         const dialogShown = await waitForWatchAdButton(page, 20);
@@ -423,11 +498,12 @@ async function runBrowser() {
         }
         await safeScreenshot(page, 'screenshot3_watch_ad_dialog.png');
 
-        // ── 第四步：点击 Watch Ad，播放广告，最多等待 30 秒 ──
+        // ── 第四步：点击 Watch Ad，开启智能广告播放与关闭监控 ──
         await clickWatchAd(page);
-        log('等待广告播放，最多 30 秒...');
-        await new Promise(r => setTimeout(r, 30000));
-        await safeScreenshot(page, 'screenshot4_after_ad.png');
+        
+        // 关键改进：自动扫描并点击关闭按钮
+        await handleAdPlayback(page);
+        await safeScreenshot(page, 'screenshot4_after_ad_handled.png');
 
         // ── 第五步：重新回到 Timer 页，读取续期后剩余时间 ──
         const after = await readTimerPage(page, 'screenshot5_timer_after.png');
