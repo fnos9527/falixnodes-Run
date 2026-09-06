@@ -12,14 +12,22 @@ function log(msg) {
 fs.writeFileSync('status.txt', '失败: 脚本异常中断');
 log('脚本启动。');
 
-// ─── 1. 解析 VLESS ────────────────────────────────────────────────────────────
 const vlessLink = process.env.VLESS_LINK;
+const falixEmail = process.env.FALIX_EMAIL;
+const falixPassword = process.env.FALIX_PASSWORD;
+
 if (!vlessLink) {
     log('错误：未找到 VLESS_LINK！');
     fs.writeFileSync('status.txt', '失败: 未配置 VLESS_LINK');
     process.exit(1);
 }
+if (!falixEmail || !falixPassword) {
+    log('错误：未配置 FALIX_EMAIL 或 FALIX_PASSWORD！');
+    fs.writeFileSync('status.txt', '失败: 未配置 FALIX_EMAIL/PASSWORD');
+    process.exit(1);
+}
 
+// ─── 1. 解析 VLESS ────────────────────────────────────────────────────────────
 function parseVless(vless) {
     try {
         const parsed = new URL(vless);
@@ -127,7 +135,6 @@ async function dismissAds(page) {
                 const s = window.getComputedStyle(el);
                 if ((s.position === 'fixed' || s.position === 'sticky') && s.display !== 'none') {
                     const r = el.getBoundingClientRect();
-                    // 只隐藏底部广告横幅（顶部 80px 以下，高度小于 200px）
                     if (r.top > 80 && r.height > 10 && r.height < 200) {
                         el.style.setProperty('display', 'none', 'important');
                         count++;
@@ -140,13 +147,13 @@ async function dismissAds(page) {
     if (n > 0) log(`广告处理: 隐藏了 ${n} 个固定定位元素。`);
 }
 
-// ─── 工具：等待 Cloudflare 人机验证通过（固定等待，配合 turnstile:true 自动过验证）──
+// ─── 工具：等待 Cloudflare 人机验证通过 ────────────────────────────────────
 async function waitForCloudflare(page, ms = 15000) {
     log(`等待 ${ms / 1000} 秒让 Cloudflare 验证通过...`);
     await new Promise(r => setTimeout(r, ms));
 }
 
-// ─── 工具：容错版 page.evaluate ──────────────────────────────────────────────
+// ─── 工具：容错版 evaluate ──────────────────────────────────────────────
 async function safeEvaluate(page, fn, { retries = 5, retryDelay = 1000, fallback = null, label = 'evaluate' } = {}) {
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
@@ -154,7 +161,7 @@ async function safeEvaluate(page, fn, { retries = 5, retryDelay = 1000, fallback
         } catch (e) {
             const isNavError = /Execution context was destroyed|context was destroyed|detached Frame|Target closed|Cannot find context/i.test(e.message);
             if (isNavError && attempt < retries) {
-                log(`[${label}] 页面正在跳转导致执行上下文失效，${retryDelay}ms 后重试 (${attempt + 1}/${retries})...`);
+                log(`[${label}] 页面正在跳转导致执行上下文失效，${retryDelay}ms 后重试...`);
                 await new Promise(r => setTimeout(r, retryDelay));
                 continue;
             }
@@ -165,7 +172,7 @@ async function safeEvaluate(page, fn, { retries = 5, retryDelay = 1000, fallback
     return fallback;
 }
 
-// ─── 工具：将 "X hours Y minutes Z seconds" 解析为总秒数，便于前后对比 ──────
+// ─── 工具：解析时间 ──────────────────────────────────────────────────────────
 function parseRemainingTime(text) {
     const full = text.match(/(\d+)\s*hours?\s*(\d+)\s*minutes?\s*(\d+)\s*seconds?/i);
     if (full) {
@@ -180,7 +187,41 @@ function parseRemainingTime(text) {
     return { raw: '未捕获到具体剩余时间', totalSeconds: null };
 }
 
-// ─── 工具：打开 Timer 页并读取当前剩余时间（登录后可反复调用）─────────────────
+// ─── 工具：验证并强力输入（防止漏字或吞字）──────────────────────────────────
+async function typeAndVerify(page, selector, text, name) {
+    for (let i = 0; i < 3; i++) {
+        const handle = await page.evaluateHandle((sel) => {
+            const els = Array.from(document.querySelectorAll(sel));
+            return els.find(el => el.offsetParent !== null) || null;
+        }, selector);
+
+        if (!handle || !handle.asElement()) {
+            throw new Error(`找不到可见的输入框: ${name}`);
+        }
+
+        const el = handle.asElement();
+        await el.focus();
+        await el.click({ clickCount: 3 });
+        await page.keyboard.press('Backspace');
+        await new Promise(r => setTimeout(r, 200));
+        
+        await el.type(text, { delay: 50 });
+        await new Promise(r => setTimeout(r, 500));
+        
+        // 读取输入框实际内容进行二次校验
+        const val = await page.evaluate(node => node.value, el);
+        
+        if (val === text) {
+            log(`[验证成功] ${name} 已正确填入。`);
+            return true;
+        }
+        log(`[验证失败] ${name} 输入被吞或未匹配 (当前值: ${val})，正在重试...`);
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    throw new Error(`无法正确输入 ${name}，重试次数超限`);
+}
+
+// ─── 工具：操作 Timer 页 ─────────────────────────────────────────────────────
 async function readTimerPage(page, screenshotName) {
     log(`导航到 Timer 页: ${TIMER_URL}`);
     await page.goto(TIMER_URL, { waitUntil: 'networkidle2', timeout: 60000 });
@@ -196,7 +237,6 @@ async function readTimerPage(page, screenshotName) {
     return timeInfo;
 }
 
-// ─── 工具：点击 "+ Add Time" 按钮 ────────────────────────────────────────────
 async function clickAddTime(page) {
     log('尝试点击 "Add Time" 按钮...');
     const result = await safeEvaluate(page, () => {
@@ -217,7 +257,6 @@ async function clickAddTime(page) {
     return result;
 }
 
-// ─── 工具：等待 "Watch Ad to Extend Timer" 弹窗中的 Watch Ad 按钮出现 ────────
 async function waitForWatchAdButton(page, maxSeconds = 15) {
     log(`等待 Watch Ad 弹窗出现（最多 ${maxSeconds} 秒）...`);
     for (let i = 0; i < maxSeconds; i++) {
@@ -231,11 +270,9 @@ async function waitForWatchAdButton(page, maxSeconds = 15) {
         if (found) { log(`Watch Ad 按钮在第 ${i + 1} 秒出现。`); return true; }
         await new Promise(r => setTimeout(r, 1000));
     }
-    log(`${maxSeconds} 秒内未出现 Watch Ad 按钮。`);
     return false;
 }
 
-// ─── 工具：点击 Watch Ad 按钮 ────────────────────────────────────────────────
 async function clickWatchAd(page) {
     log('点击 Watch Ad 按钮...');
     await safeEvaluate(page, () => {
@@ -249,10 +286,8 @@ async function clickWatchAd(page) {
         }
         return false;
     }, { label: 'clickWatchAd', fallback: false });
-    log('Watch Ad 已点击，广告开始播放。');
 }
 
-// ─── 工具：写入本次续期结果，供 Telegram 通知步骤读取 ────────────────────────
 function writeRenewResult({ beforeRaw, afterRaw, statusText }) {
     fs.writeFileSync('time_before.txt', beforeRaw || 'N/A');
     fs.writeFileSync('time_after.txt', afterRaw || 'N/A');
@@ -305,57 +340,52 @@ async function runBrowser() {
         await waitForCloudflare(page, 15000);
         await safeScreenshot(page, 'screenshot1_login_before.png');
 
-        log('开始模拟输入账号密码...');
-        const emailInput = await page.waitForSelector('input[type="email"], input[name="email"], input[name="identifier"]', { timeout: 15000 });
-        // 【修复点 1】：点击全选并清空残留（防干扰），并增加 delay 模拟真实缓慢打字
-        await emailInput.click({ clickCount: 3 });
-        await page.keyboard.press('Backspace');
-        await new Promise(r => setTimeout(r, 200));
-        await emailInput.type(process.env.FALIX_EMAIL, { delay: 50 });
+        log('开始强制校验输入账号密码...');
+        // 使用 typeAndVerify 确保绝不漏字
+        await typeAndVerify(page, 'input[name="identifier"], input[type="email"], input[name="email"]', falixEmail, '账号 (Email)');
+        await typeAndVerify(page, 'input[name="password"], input[type="password"]', falixPassword, '密码 (Password)');
         
-        const passwordInput = await page.waitForSelector('input[type="password"], input[name="password"]', { timeout: 15000 });
-        await passwordInput.click({ clickCount: 3 });
-        await page.keyboard.press('Backspace');
-        await new Promise(r => setTimeout(r, 200));
-        await passwordInput.type(process.env.FALIX_PASSWORD, { delay: 50 });
-        
-        log('等待 3 秒以确保 React 状态更新且 Turnstile 安全盾已通过...');
-        await new Promise(r => setTimeout(r, 3000));
+        log('等待 5 秒以确保 React 状态更新且 Turnstile 安全盾已通过...');
+        await new Promise(r => setTimeout(r, 5000));
         await safeScreenshot(page, 'screenshot1_login_filled.png');
 
-        log('查找并点击蓝色的 Sign In 主按钮...');
-        const loginClicked = await safeEvaluate(page, () => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            // 【修复点 2】：利用 Clerk 框架主按钮特征 class "cl-formButtonPrimary" 或精准定位文本，避开"Sign in with passkey" 等次要按钮
-            let target = btns.find(b => typeof b.className === 'string' && b.className.includes('cl-formButtonPrimary'));
-            if (!target) {
-                target = btns.find(b => b.textContent.trim() === 'Sign In' && b.offsetParent !== null);
-            }
-            if (target && !target.disabled) {
-                target.scrollIntoView({ block: 'center' });
-                target.click(); // DOM 直触，比 page.click 稳定
-                return true;
-            }
-            return false;
-        }, { label: 'clickSignIn' });
+        // 【修复点2】双重提交策略：先尝试敲击回车
+        log('尝试按 Enter 键提交表单...');
+        await page.keyboard.press('Enter');
         
-        if (!loginClicked) {
-            log('未通过精准匹配找到可用 Sign In，尝试 fallback 使用选择器点击...');
-            const fallbackBtn = await page.$('button.cl-formButtonPrimary, button[type="submit"]');
-            if (fallbackBtn) {
-                await fallbackBtn.click();
+        log('等待 5 秒检查是否发生跳转...');
+        await new Promise(r => setTimeout(r, 5000));
+
+        // 如果按回车没起效还在登录页，尝试用鼠标坐标点击蓝色的大按钮
+        if (page.url().includes('/auth/login')) {
+            log('按 Enter 后仍未跳转，尝试精确点击 Sign In 按钮...');
+            const btnRect = await page.evaluate(() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                let target = btns.find(b => typeof b.className === 'string' && b.className.includes('cl-formButtonPrimary'));
+                if (!target) {
+                    target = btns.find(b => b.textContent.trim() === 'Sign In' && b.offsetParent !== null);
+                }
+                if (target && !target.disabled) {
+                    target.scrollIntoView({ block: 'center' });
+                    const rect = target.getBoundingClientRect();
+                    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                }
+                return null;
+            });
+            if (btnRect) {
+                await page.mouse.click(btnRect.x, btnRect.y);
+                log('已精确点击坐标位置，等待 10 秒...');
+                await new Promise(r => setTimeout(r, 10000));
             } else {
-                log('⚠️ 警告：页面上未找到可以点击的登录按钮！');
+                log('未能找到可点击的 Sign In 按钮坐标。');
             }
         }
-
-        log('已点击登录，等待 15 秒跳转处理...');
-        await new Promise(r => setTimeout(r, 15000));
         
         const currentUrl = page.url();
         log('当前 URL: ' + currentUrl);
         if (currentUrl.includes('/auth/login')) {
-            log('⚠️ 警告：当前仍然在登录页，大概率是表单未被正确提交。');
+            log('⚠️ 警告：当前仍然在登录页，表单可能提交失败！');
+            await safeScreenshot(page, 'screenshot1_login_failed.png');
         }
 
         // ── 第一步：打开 Timer 页，读取续期前剩余时间 ──
@@ -377,7 +407,7 @@ async function runBrowser() {
 
         log('Add Time 点击完毕，缓冲等待并检查是否有 Cloudflare 二次拦截...');
         await new Promise(r => setTimeout(r, 3000));
-        await waitForCloudflare(page, 10000); // 再次等待 CF 盾过去
+        await waitForCloudflare(page, 10000);
 
         // ── 第三步：等待 "Watch Ad to Extend Timer" 弹窗 ──
         const dialogShown = await waitForWatchAdButton(page, 20);
@@ -387,7 +417,7 @@ async function runBrowser() {
             writeRenewResult({
                 beforeRaw: before.raw,
                 afterRaw: before.raw,
-                statusText: '⚠️ 无需续期: 未出现 Watch Ad 弹窗（剩余时间可能已接近上限）'
+                statusText: '⚠️ 无需续期: 未出现 Watch Ad 弹窗（可能剩余时间接近上限）'
             });
             return;
         }
