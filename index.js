@@ -257,7 +257,6 @@ function writeRenewResult({ beforeRaw, afterRaw, statusText }) {
     fs.writeFileSync('time_before.txt', beforeRaw || 'N/A');
     fs.writeFileSync('time_after.txt', afterRaw || 'N/A');
     fs.writeFileSync('status.txt', statusText);
-    // 兼容旧字段
     fs.writeFileSync('timer_status.txt', beforeRaw || 'N/A');
 }
 
@@ -266,7 +265,7 @@ async function runBrowser() {
     log('准备启动浏览器...');
     
     let browser, page;
-    let launchRetries = 3; // 设置浏览器启动重试次数
+    let launchRetries = 3;
     
     for (let i = 0; i < launchRetries; i++) {
         try {
@@ -278,8 +277,8 @@ async function runBrowser() {
                     '--proxy-server=socks5://127.0.0.1:10808',
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',    // 【修复1】至关重要！解决 GitHub Actions 中内存溢出导致的崩溃
-                    '--disable-gpu',              // 禁用 GPU 加速，提高 CI 环境稳定性
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
                     '--disable-software-rasterizer',
                     '--window-size=1920,1080',
                 ],
@@ -287,11 +286,11 @@ async function runBrowser() {
             });
             browser = browserData.browser;
             page = browserData.page;
-            break; // 成功启动，跳出循环
+            break; 
         } catch (err) {
             log(`浏览器启动失败: ${err.message}`);
             if (i === launchRetries - 1) throw new Error('浏览器启动重试达到上限，放弃。');
-            await new Promise(r => setTimeout(r, 5000)); // 等待 5 秒后重试
+            await new Promise(r => setTimeout(r, 5000));
         }
     }
 
@@ -304,21 +303,63 @@ async function runBrowser() {
         log('导航到登录页...');
         await page.goto('https://client.falixnodes.net/auth/login', { waitUntil: 'networkidle2', timeout: 60000 });
         await waitForCloudflare(page, 15000);
-        await safeScreenshot(page, 'screenshot1_login.png');
+        await safeScreenshot(page, 'screenshot1_login_before.png');
 
-        const emailInput = await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 15000 });
-        await emailInput.type(process.env.FALIX_EMAIL);
+        log('开始模拟输入账号密码...');
+        const emailInput = await page.waitForSelector('input[type="email"], input[name="email"], input[name="identifier"]', { timeout: 15000 });
+        // 【修复点 1】：点击全选并清空残留（防干扰），并增加 delay 模拟真实缓慢打字
+        await emailInput.click({ clickCount: 3 });
+        await page.keyboard.press('Backspace');
+        await new Promise(r => setTimeout(r, 200));
+        await emailInput.type(process.env.FALIX_EMAIL, { delay: 50 });
+        
         const passwordInput = await page.waitForSelector('input[type="password"], input[name="password"]', { timeout: 15000 });
-        await passwordInput.type(process.env.FALIX_PASSWORD);
-        const signInBtn = await page.waitForSelector('button[type="submit"]', { timeout: 15000 });
-        await signInBtn.click();
-        log('已点击登录，等待 10 秒...');
-        await new Promise(r => setTimeout(r, 10000));
-        log('当前 URL: ' + page.url());
+        await passwordInput.click({ clickCount: 3 });
+        await page.keyboard.press('Backspace');
+        await new Promise(r => setTimeout(r, 200));
+        await passwordInput.type(process.env.FALIX_PASSWORD, { delay: 50 });
+        
+        log('等待 3 秒以确保 React 状态更新且 Turnstile 安全盾已通过...');
+        await new Promise(r => setTimeout(r, 3000));
+        await safeScreenshot(page, 'screenshot1_login_filled.png');
+
+        log('查找并点击蓝色的 Sign In 主按钮...');
+        const loginClicked = await safeEvaluate(page, () => {
+            const btns = Array.from(document.querySelectorAll('button'));
+            // 【修复点 2】：利用 Clerk 框架主按钮特征 class "cl-formButtonPrimary" 或精准定位文本，避开"Sign in with passkey" 等次要按钮
+            let target = btns.find(b => typeof b.className === 'string' && b.className.includes('cl-formButtonPrimary'));
+            if (!target) {
+                target = btns.find(b => b.textContent.trim() === 'Sign In' && b.offsetParent !== null);
+            }
+            if (target && !target.disabled) {
+                target.scrollIntoView({ block: 'center' });
+                target.click(); // DOM 直触，比 page.click 稳定
+                return true;
+            }
+            return false;
+        }, { label: 'clickSignIn' });
+        
+        if (!loginClicked) {
+            log('未通过精准匹配找到可用 Sign In，尝试 fallback 使用选择器点击...');
+            const fallbackBtn = await page.$('button.cl-formButtonPrimary, button[type="submit"]');
+            if (fallbackBtn) {
+                await fallbackBtn.click();
+            } else {
+                log('⚠️ 警告：页面上未找到可以点击的登录按钮！');
+            }
+        }
+
+        log('已点击登录，等待 15 秒跳转处理...');
+        await new Promise(r => setTimeout(r, 15000));
+        
+        const currentUrl = page.url();
+        log('当前 URL: ' + currentUrl);
+        if (currentUrl.includes('/auth/login')) {
+            log('⚠️ 警告：当前仍然在登录页，大概率是表单未被正确提交。');
+        }
 
         // ── 第一步：打开 Timer 页，读取续期前剩余时间 ──
         const before = await readTimerPage(page, 'screenshot2_timer_before.png');
-        // 立刻写盘：即使后面步骤异常中断，通知里也能看到真实的续期前时间
         fs.writeFileSync('time_before.txt', before.raw || 'N/A');
 
         // ── 第二步：点击 "+ Add Time" ──
@@ -329,12 +370,11 @@ async function runBrowser() {
             writeRenewResult({
                 beforeRaw: before.raw,
                 afterRaw: 'N/A',
-                statusText: '❌ 续期失败: 未找到 Add Time 按钮'
+                statusText: '❌ 续期失败: 未找到 Add Time 按钮 (可能登录未成功)'
             });
             return;
         }
 
-        // 【修复2】点击 Add Time 后极大概率触发 Cloudflare 二次验证，等待盾通过
         log('Add Time 点击完毕，缓冲等待并检查是否有 Cloudflare 二次拦截...');
         await new Promise(r => setTimeout(r, 3000));
         await waitForCloudflare(page, 10000); // 再次等待 CF 盾过去
