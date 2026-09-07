@@ -189,34 +189,86 @@ function parseRemainingTime(text) {
 
 // ─── 工具：验证并强力输入（防止漏字或吞字）──────────────────────────────────
 async function typeAndVerify(page, selector, text, name) {
-    for (let i = 0; i < 3; i++) {
-        const handle = await page.evaluateHandle((sel) => {
+    // 提前等待元素出现，避免网络延迟导致找不到元素
+    await page.waitForSelector(selector, { visible: true, timeout: 15000 }).catch(() => {});
+
+    for (let i = 0; i < 4; i++) {
+        log(`开始输入 ${name} (尝试 ${i + 1}/4)...`);
+        
+        // 1. 获取元素并使用 React 兼容方式清空（防止因框架机制导致清空失败）
+        const exists = await page.evaluate((sel) => {
             const els = Array.from(document.querySelectorAll(sel));
-            return els.find(el => el.offsetParent !== null) || null;
+            const el = els.find(e => e.offsetParent !== null);
+            if (!el) return false;
+            
+            el.focus();
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+            if (nativeInputValueSetter) {
+                nativeInputValueSetter.call(el, '');
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            } else {
+                el.value = '';
+            }
+            return true;
         }, selector);
 
-        if (!handle || !handle.asElement()) {
+        if (!exists) {
             throw new Error(`找不到可见的输入框: ${name}`);
         }
-
-        const el = handle.asElement();
-        await el.focus();
-        await el.click({ clickCount: 3 });
-        await page.keyboard.press('Backspace');
-        await new Promise(r => setTimeout(r, 200));
         
-        await el.type(text, { delay: 50 });
+        await new Promise(r => setTimeout(r, 500));
+
+        // 2. 逐字输入，每次输入前动态获取焦点（防止 Turnstile 验证码 iframe 抢夺焦点导致吞字）
+        for (const char of text) {
+            await page.evaluate((sel) => {
+                const el = Array.from(document.querySelectorAll(sel)).find(e => e.offsetParent !== null);
+                if (el) el.focus();
+            }, selector);
+            await page.keyboard.type(char, { delay: 80 });
+        }
+        
         await new Promise(r => setTimeout(r, 500));
         
-        const val = await page.evaluate(node => node.value, el);
+        // 3. 验证输入结果
+        const val = await page.evaluate((sel) => {
+            const el = Array.from(document.querySelectorAll(sel)).find(e => e.offsetParent !== null);
+            return el ? el.value : null;
+        }, selector);
+        
         if (val === text) {
             log(`[验证成功] ${name} 已正确填入。`);
             return true;
         }
-        log(`[验证失败] ${name} 输入被吞或未匹配 (当前值: ${val})，正在重试...`);
-        await new Promise(r => setTimeout(r, 1000));
+        
+        log(`[验证失败] ${name} 输入被吞或未匹配 (期望: ${text}, 当前: ${val})，正在重试...`);
+        await new Promise(r => setTimeout(r, 1500));
     }
-    throw new Error(`无法正确输入 ${name}，重试次数超限`);
+    
+    // 4. 后备方案：强行注入赋值 (若正常模拟键盘连续被吞，以此方案保底)
+    log(`[后备方案] 尝试直接通过 JS 暴力赋值给 ${name}...`);
+    const finalVal = await page.evaluate((sel, txt) => {
+        const el = Array.from(document.querySelectorAll(sel)).find(e => e.offsetParent !== null);
+        if (el) {
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+            if (nativeInputValueSetter) {
+                nativeInputValueSetter.call(el, txt);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            } else {
+                el.value = txt;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            return el.value;
+        }
+        return null;
+    }, selector, text);
+    
+    if (finalVal === text) {
+         log(`[验证成功] ${name} 已通过强行赋值填入。`);
+         return true;
+    }
+
+    throw new Error(`无法正确输入 ${name}，重试次数超限，最终值: ${finalVal}`);
 }
 
 // ─── 工具：操作 Timer 页 ─────────────────────────────────────────────────────
