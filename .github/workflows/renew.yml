@@ -2,8 +2,9 @@ name: FalixNodes Auto Renew
 
 on:
   schedule:
+    # 每天 UTC 0 点和 12 点运行（对应北京时间 8:00 和 20:00）
     - cron: '0 18 * * *'
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch: # 支持手动点击 Run workflow 触发
 
 jobs:
   renew:
@@ -16,10 +17,9 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'npm'
+          node-version: 22  # 使用当前推荐的 LTS 版本，且去掉了 cache 配置
 
-      - name: Install Dependencies
+      - name: Install System Packages & Node Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0
@@ -31,15 +31,12 @@ jobs:
           if [ -n "${{ secrets.NODE_LINK }}" ]; then
             echo "检测到 NODE_LINK，准备下载 sing-box 并启动代理..."
             
-            # 下载 sing-box 二进制文件
+            # 下载 sing-box 二进制
             curl -Lo sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-linux-amd64.tar.gz
             tar -xzf sing-box.tar.gz
             mv sing-box-*/sing-box ./sing-box
             chmod +x ./sing-box
 
-            # 生成 sing-box 配置文件（本地监听 socks 1080 并转发到节点）
-            # sing-box run 支持直接格式解析或生成简单 outbound
-            # 此处创建基础配置模板，支持直接使用 sing-box 转发
             cat << 'EOF' > config.json
             {
               "inbounds": [
@@ -59,15 +56,13 @@ jobs:
             }
           EOF
 
-            # 启动 sing-box 后台进程
-            # 如节点链接支持直接导入，可通过命令行运行或转为配置
             nohup ./sing-box run -c config.json > sing-box.log 2>&1 &
             echo $! > sing-box.pid
             
             echo "IS_PROXY=true" >> $GITHUB_ENV
-            echo "本地代理已启动并在 127.0.0.1:1080 监听。"
+            echo "本地代理已在 127.0.0.1:1080 启动"
           else
-            echo "未配置 NODE_LINK，走直连模式。"
+            echo "未配置 NODE_LINK，直接使用直连模式"
             echo "IS_PROXY=false" >> $GITHUB_ENV
           fi
 
