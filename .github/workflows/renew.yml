@@ -2,7 +2,7 @@ name: FalixNodes Auto Renew
 
 on:
   schedule:
-    # 每天 UTC 0 点和 12 点运行（对应北京时间 8:00 和 20:00）
+    # 每天 UTC 0 点和 12 点运行（北京时间 8:00 和 20:00）
     - cron: '0 18 * * *'
   workflow_dispatch: # 支持手动点击 Run workflow 触发
 
@@ -22,52 +22,97 @@ jobs:
       - name: Install System Packages & Node Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb curl jq
+          sudo apt-get install -y xvfb curl
           npm install
 
       - name: Setup optional VLESS/VMess/Trojan node
         id: proxy_setup
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          if [ -n "${{ secrets.NODE_LINK }}" ]; then
-            echo "检测到 NODE_LINK，正在配置代理环境..."
+          if [ -n "$NODE_LINK" ]; then
+            echo "检测到 NODE_LINK，正在启动 sing-box 代理..."
             
-            # 1. 下载并启动 subconverter (用于将 vless/vmess/trojan 链接转为标准配置)
-            curl -Lo subconverter.tar.gz https://github.com/tindy2013/subconverter/releases/download/v0.9.0/subconverter_linux64.tar.gz
-            tar -xzf subconverter.tar.gz
-            chmod +x ./subconverter/subconverter
-            nohup ./subconverter/subconverter > subconverter.log 2>&1 &
-            echo $! > subconverter.pid
-            sleep 2
+            # 下载最新 sing-box
+            curl -Lo sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-linux-amd64.tar.gz
+            tar -xzf sing-box.tar.gz
+            mv sing-box-*/sing-box ./sing-box
+            chmod +x ./sing-box
 
-            # 2. 转换节点链接为 clash 格式配置
-            NODE_ENCODED=$(node -e "console.log(encodeURIComponent(process.env.NODE_LINK))" <<< "${{ secrets.NODE_LINK }}")
-            curl -s "http://127.0.0.1:25500/sub?target=clash&url=${NODE_ENCODED}" -o config.yaml
+            # 使用 node 脚本解析 VLESS 链接并生成标准 sing-box 配置
+            node -e '
+              const url = new URL(process.env.NODE_LINK);
+              const protocol = url.protocol.replace(":", "");
+              const uuid = url.username;
+              const server = url.hostname;
+              const server_port = parseInt(url.port || (url.protocol === "vless:" ? "443" : "80"));
+              const params = url.searchParams;
 
-            # 3. 补充本地监听端口与全局模式配置
-            sed -i '1i mixed-port: 1080\nmode: global\nallow-lan: false\nlog-level: info\n' config.yaml
+              let outbound = {
+                type: protocol,
+                tag: "proxy-out",
+                server: server,
+                server_port: server_port,
+                uuid: uuid
+              };
 
-            # 4. 下载并运行 mihomo (Clash.Meta)
-            curl -Lo mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.19.0/mihomo-linux-amd64-v1.19.0.gz
-            gzip -d mihomo.gz
-            chmod +x mihomo
-            nohup ./mihomo -d . -f config.yaml > proxy.log 2>&1 &
-            echo $! > proxy.pid
+              if (params.get("security") === "tls") {
+                outbound.tls = {
+                  enabled: true,
+                  server_name: params.get("sni") || server,
+                  insecure: params.get("insecure") === "1" || params.get("allowInsecure") === "1"
+                };
+                if (params.get("fp")) {
+                  outbound.tls.utls = { enabled: true, fingerprint: params.get("fp") };
+                }
+              }
+
+              const netType = params.get("type");
+              if (netType === "ws") {
+                outbound.transport = {
+                  type: "ws",
+                  path: params.get("path") || "/",
+                  headers: {
+                    Host: params.get("host") || params.get("sni") || server
+                  }
+                };
+              }
+
+              const config = {
+                log: { level: "info" },
+                inbounds: [{
+                  type: "socks",
+                  tag: "socks-in",
+                  listen: "127.0.0.1",
+                  listen_port: 1080
+                }],
+                outbounds: [
+                  outbound,
+                  { type: "direct", tag: "direct" }
+                ]
+              };
+
+              require("fs").writeFileSync("singbox-config.json", JSON.stringify(config, null, 2));
+            '
+
+            # 启动 sing-box
+            nohup ./sing-box run -c singbox-config.json > sing-box.log 2>&1 &
+            echo $! > sing-box.pid
             sleep 3
 
-            # 5. 测试代理是否可用
-            echo "正在测试代理联通性..."
+            # 联通性测试
             TEST_IP=$(curl -s --socks5 127.0.0.1:1080 --max-time 10 https://api.ipify.org || true)
             if [ -n "$TEST_IP" ]; then
-              echo "✅ 代理启动成功！当前出口 IP: $TEST_IP"
+              echo "✅ 节点代理启动成功！当前出口 IP: $TEST_IP"
               echo "IS_PROXY=true" >> $GITHUB_ENV
             else
-              echo "⚠️ 代理测试连接失败（请检查节点是否失效或被防火墙拦截），代理日志如下："
-              cat proxy.log || true
-              echo "自动降级为直连模式..."
+              echo "⚠️ 节点代理未能连通网络，sing-box 日志如下："
+              cat sing-box.log || true
+              echo "已自动降级为直连模式..."
               echo "IS_PROXY=false" >> $GITHUB_ENV
             fi
           else
-            echo "未配置 NODE_LINK，使用直连模式。"
+            echo "未配置 NODE_LINK，直接使用直连模式。"
             echo "IS_PROXY=false" >> $GITHUB_ENV
           fi
 
@@ -79,17 +124,21 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
+          mkdir -p screenshots
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" node renew.js
+
+      - name: Upload Screenshots Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falix-screenshots
+          path: screenshots/
+          retention-days: 7
 
       - name: Cleanup Proxy
         if: always()
         run: |
-          if [ -f proxy.pid ]; then
-            echo "清理代理进程..."
-            kill -9 $(cat proxy.pid) || true
+          if [ -f sing-box.pid ]; then
+            kill -9 $(cat sing-box.pid) || true
           fi
-          if [ -f subconverter.pid ]; then
-            kill -9 $(cat subconverter.pid) || true
-          fi
-          rm -rf proxy.pid subconverter.pid subconverter* config.yaml mihomo* proxy.log
-          echo "代理环境清理完成。"
+          rm -rf sing-box* config.json singbox-config.json
