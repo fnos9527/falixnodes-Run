@@ -17,12 +17,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22  # 使用当前推荐的 LTS 版本，且去掉了 cache 配置
+          node-version: 22
 
       - name: Install System Packages & Node Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0
+          sudo apt-get install -y xvfb
           npm install
 
       - name: Setup optional VLESS/VMess/Trojan node
