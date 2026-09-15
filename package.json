@@ -1,0 +1,11 @@
+{
+  "name": "falix-auto-renew",
+  "version": "1.0.0",
+  "description": "Falixnodes Auto Renew Script",
+  "main": "renew.js",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "form-data": "^4.0.0",
+    "puppeteer-real-browser": "^1.2.9"
+  }
+}
