@@ -2,7 +2,6 @@ const { connect } = require('puppeteer-real-browser');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const FormData = require('form-data');
 
 const EMAIL = process.env.FALIX_EMAIL;
 const PASSWORD = process.env.FALIX_PASSWORD;
@@ -44,8 +43,8 @@ async function extractTimerText(page) {
   }
 }
 
-// 发送 Telegram 消息与图片
-async function sendTelegramNotification(text, photoPaths = []) {
+// 仅发送 Telegram 纯文字通知
+async function sendTelegramNotification(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
     console.log('未配置 Telegram 凭据，跳过发送 TG 通知。');
     return;
@@ -56,17 +55,7 @@ async function sendTelegramNotification(text, photoPaths = []) {
       text: text,
       parse_mode: 'HTML'
     });
-
-    for (const photoPath of photoPaths) {
-      if (fs.existsSync(photoPath)) {
-        const form = new FormData();
-        form.append('chat_id', TG_CHAT_ID);
-        form.append('photo', fs.createReadStream(photoPath));
-        await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, form, {
-          headers: form.getHeaders()
-        });
-      }
-    }
+    console.log('TG 纯文字通知发送成功');
   } catch (err) {
     console.error('发送 TG 消息失败:', err.message);
   }
@@ -75,7 +64,6 @@ async function sendTelegramNotification(text, photoPaths = []) {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function run() {
-  const screenshots = [];
   let initialTimeText = '未知';
   let finalTimeText = '未知';
   let initialSeconds = 0;
@@ -124,9 +112,9 @@ async function run() {
     }
 
     await sleep(8000);
+    // 保存截图 1：登录结果（供 GitHub Artifacts 下载）
     const loginPic = path.join(SCREENSHOT_DIR, '01_login_result.png');
     await page.screenshot({ path: loginPic, fullPage: true });
-    screenshots.push(loginPic);
     console.log('已保存关键截图 1：登录结果');
 
     // 2. 循环续期与重试（最多 3 次）
@@ -136,11 +124,10 @@ async function run() {
       await page.goto(TIMER_URL, { waitUntil: 'networkidle2', timeout: 60000 });
       await sleep(4000);
 
-      // 截图 2：转到续期页面
+      // 保存截图 2：转到续期页面
       if (attempt === 1) {
         const timerPic = path.join(SCREENSHOT_DIR, '02_timer_page.png');
         await page.screenshot({ path: timerPic, fullPage: true });
-        screenshots.push(timerPic);
         console.log('已保存关键截图 2：续期初始页面');
 
         const curText = await extractTimerText(page);
@@ -199,13 +186,12 @@ async function run() {
       }
     }
 
-    // 截图 3：最后确认页面
+    // 保存截图 3：最后确认页面
     const finalPic = path.join(SCREENSHOT_DIR, '03_final_confirmation.png');
     await page.screenshot({ path: finalPic, fullPage: true });
-    screenshots.push(finalPic);
     console.log('已保存关键截图 3：最终确认页面');
 
-    // 发送 Telegram 汇总通知
+    // 仅发送 Telegram 纯文字汇总通知
     const statusEmoji = isSuccess ? '🎉' : '❌';
     const tgMessage = `
 <b>${statusEmoji} FalixNodes 续期${isSuccess ? '成功' : '失败'}通知</b>
@@ -217,11 +203,11 @@ async function run() {
 <b>执行时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}
     `.trim();
 
-    await sendTelegramNotification(tgMessage, screenshots);
+    await sendTelegramNotification(tgMessage);
 
   } catch (err) {
     console.error('运行异常:', err);
-    await sendTelegramNotification(`❌ <b>FalixNodes 脚本运行异常</b>\n报错: <code>${err.message}</code>`, screenshots);
+    await sendTelegramNotification(`❌ <b>FalixNodes 脚本运行异常</b>\n报错: <code>${err.message}</code>`);
   } finally {
     await browser.close();
     console.log('浏览器已退出。');
