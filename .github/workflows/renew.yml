@@ -22,47 +22,52 @@ jobs:
       - name: Install System Packages & Node Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb curl jq
           npm install
 
       - name: Setup optional VLESS/VMess/Trojan node
         id: proxy_setup
         run: |
           if [ -n "${{ secrets.NODE_LINK }}" ]; then
-            echo "检测到 NODE_LINK，准备下载 sing-box 并启动代理..."
+            echo "检测到 NODE_LINK，正在配置代理环境..."
             
-            # 下载 sing-box 二进制
-            curl -Lo sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-linux-amd64.tar.gz
-            tar -xzf sing-box.tar.gz
-            mv sing-box-*/sing-box ./sing-box
-            chmod +x ./sing-box
+            # 1. 下载并启动 subconverter (用于将 vless/vmess/trojan 链接转为标准配置)
+            curl -Lo subconverter.tar.gz https://github.com/tindy2013/subconverter/releases/download/v0.9.0/subconverter_linux64.tar.gz
+            tar -xzf subconverter.tar.gz
+            chmod +x ./subconverter/subconverter
+            nohup ./subconverter/subconverter > subconverter.log 2>&1 &
+            echo $! > subconverter.pid
+            sleep 2
 
-            cat << 'EOF' > config.json
-            {
-              "inbounds": [
-                {
-                  "type": "socks",
-                  "tag": "socks-in",
-                  "listen": "127.0.0.1",
-                  "listen_port": 1080
-                }
-              ],
-              "outbounds": [
-                {
-                  "type": "urltest",
-                  "tag": "proxy"
-                }
-              ]
-            }
-          EOF
+            # 2. 转换节点链接为 clash 格式配置
+            NODE_ENCODED=$(node -e "console.log(encodeURIComponent(process.env.NODE_LINK))" <<< "${{ secrets.NODE_LINK }}")
+            curl -s "http://127.0.0.1:25500/sub?target=clash&url=${NODE_ENCODED}" -o config.yaml
 
-            nohup ./sing-box run -c config.json > sing-box.log 2>&1 &
-            echo $! > sing-box.pid
-            
-            echo "IS_PROXY=true" >> $GITHUB_ENV
-            echo "本地代理已在 127.0.0.1:1080 启动"
+            # 3. 补充本地监听端口与全局模式配置
+            sed -i '1i mixed-port: 1080\nmode: global\nallow-lan: false\nlog-level: info\n' config.yaml
+
+            # 4. 下载并运行 mihomo (Clash.Meta)
+            curl -Lo mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.19.0/mihomo-linux-amd64-v1.19.0.gz
+            gzip -d mihomo.gz
+            chmod +x mihomo
+            nohup ./mihomo -d . -f config.yaml > proxy.log 2>&1 &
+            echo $! > proxy.pid
+            sleep 3
+
+            # 5. 测试代理是否可用
+            echo "正在测试代理联通性..."
+            TEST_IP=$(curl -s --socks5 127.0.0.1:1080 --max-time 10 https://api.ipify.org || true)
+            if [ -n "$TEST_IP" ]; then
+              echo "✅ 代理启动成功！当前出口 IP: $TEST_IP"
+              echo "IS_PROXY=true" >> $GITHUB_ENV
+            else
+              echo "⚠️ 代理测试连接失败（请检查节点是否失效或被防火墙拦截），代理日志如下："
+              cat proxy.log || true
+              echo "自动降级为直连模式..."
+              echo "IS_PROXY=false" >> $GITHUB_ENV
+            fi
           else
-            echo "未配置 NODE_LINK，直接使用直连模式"
+            echo "未配置 NODE_LINK，使用直连模式。"
             echo "IS_PROXY=false" >> $GITHUB_ENV
           fi
 
@@ -79,9 +84,12 @@ jobs:
       - name: Cleanup Proxy
         if: always()
         run: |
-          if [ -f sing-box.pid ]; then
-            echo "清理 sing-box 代理进程..."
-            kill -9 $(cat sing-box.pid) || true
-            rm -f sing-box.pid sing-box.tar.gz sing-box config.json sing-box.log
+          if [ -f proxy.pid ]; then
+            echo "清理代理进程..."
+            kill -9 $(cat proxy.pid) || true
           fi
-          echo "清理完成。"
+          if [ -f subconverter.pid ]; then
+            kill -9 $(cat subconverter.pid) || true
+          fi
+          rm -rf proxy.pid subconverter.pid subconverter* config.yaml mihomo* proxy.log
+          echo "代理环境清理完成。"
