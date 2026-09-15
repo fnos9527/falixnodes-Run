@@ -1,0 +1,92 @@
+name: FalixNodes Auto Renew
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0
+          npm install
+
+      - name: Setup optional VLESS/VMess/Trojan node
+        id: proxy_setup
+        run: |
+          if [ -n "${{ secrets.NODE_LINK }}" ]; then
+            echo "检测到 NODE_LINK，准备下载 sing-box 并启动代理..."
+            
+            # 下载 sing-box 二进制文件
+            curl -Lo sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-linux-amd64.tar.gz
+            tar -xzf sing-box.tar.gz
+            mv sing-box-*/sing-box ./sing-box
+            chmod +x ./sing-box
+
+            # 生成 sing-box 配置文件（本地监听 socks 1080 并转发到节点）
+            # sing-box run 支持直接格式解析或生成简单 outbound
+            # 此处创建基础配置模板，支持直接使用 sing-box 转发
+            cat << 'EOF' > config.json
+            {
+              "inbounds": [
+                {
+                  "type": "socks",
+                  "tag": "socks-in",
+                  "listen": "127.0.0.1",
+                  "listen_port": 1080
+                }
+              ],
+              "outbounds": [
+                {
+                  "type": "urltest",
+                  "tag": "proxy"
+                }
+              ]
+            }
+          EOF
+
+            # 启动 sing-box 后台进程
+            # 如节点链接支持直接导入，可通过命令行运行或转为配置
+            nohup ./sing-box run -c config.json > sing-box.log 2>&1 &
+            echo $! > sing-box.pid
+            
+            echo "IS_PROXY=true" >> $GITHUB_ENV
+            echo "本地代理已启动并在 127.0.0.1:1080 监听。"
+          else
+            echo "未配置 NODE_LINK，走直连模式。"
+            echo "IS_PROXY=false" >> $GITHUB_ENV
+          fi
+
+      - name: Run Puppeteer with Xvfb
+        env:
+          FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+          FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+          SERVER_ID: ${{ secrets.SERVER_ID || '2845100' }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" node renew.js
+
+      - name: Cleanup Proxy
+        if: always()
+        run: |
+          if [ -f sing-box.pid ]; then
+            echo "清理 sing-box 代理进程..."
+            kill -9 $(cat sing-box.pid) || true
+            rm -f sing-box.pid sing-box.tar.gz sing-box config.json sing-box.log
+          fi
+          echo "清理完成。"
