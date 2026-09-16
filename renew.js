@@ -46,48 +46,92 @@ async function extractTimerText(page) {
 }
 
 /**
- * 稳定输入函数：
- * 1. 每次都重新查询元素（避免元素被重新渲染后引用失效）
- * 2. 点击并全选、清空，再输入
- * 3. 输入完成后立刻读取输入框实际的 value 进行比对
- * 4. 如果不一致（比如只打进去了 "af"），自动清空重试，最多重试 maxRetries 次
- * 这样即使页面在输入过程中因为 Cloudflare 验证/React 渲染导致输入被打断，
- * 也能被检测出来并自动修正，而不是"打错了也不知道，直接往下走"。
+ * 用原生 value setter 一次性把值注入到输入框，并触发 input/change 事件。
+ * 这样绕开了"一个字符一个字符模拟按键"的过程，不存在"打到一半被打断"的问题——
+ * 这是解决"输入内容随机被截断/篡改"最根本的办法（普通的 page.type 本质是逐键发送
+ * 键盘事件，很容易被页面上其他异步脚本、Cloudflare 校验等打断，且打断点是随机的）。
+ *
+ * React/Vue 等框架会重写 input 的 value setter 来做双向绑定追踪，所以如果直接
+ * `input.value = xxx` 通常不会被框架检测到（onChange 不会触发）。这里通过
+ * Object.getOwnPropertyDescriptor 拿到 HTMLInputElement 原生的 setter 来绕过框架
+ * 的拦截，再手动 dispatch 'input' 和 'change' 事件，让框架能正确感知到这次变化。
  */
-async function safeType(page, selector, text, { maxRetries = 6, label = '' } = {}) {
+async function injectValue(page, selector, value) {
+  await page.evaluate((sel, val) => {
+    const input = document.querySelector(sel);
+    if (!input) return false;
+    const proto = window.HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    input.focus();
+    nativeSetter.call(input, '');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    nativeSetter.call(input, val);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }, selector, value);
+}
+
+/**
+ * 稳定输入函数（升级版）：
+ * 1. 用 injectValue 一次性注入完整值（而不是逐字模拟打字）
+ * 2. 注入后做"两次延时校验"：立刻读一次，再等 300ms 读一次
+ *    —— 如果页面上有脚本会异步把值改掉/清空，两次读取就能发现不一致
+ * 3. 只要任意一次校验不通过，就整体重新注入，最多重试 maxRetries 次
+ * 4. 全部失败后，兜底尝试原来的逐字模拟打字方式，以防个别站点必须要"真实按键事件"
+ */
+async function safeType(page, selector, text, { maxRetries = 8, label = '' } = {}) {
   for (let i = 1; i <= maxRetries; i++) {
-    const el = await page.$(selector);
-    if (!el) {
+    const exists = await page.$(selector);
+    if (!exists) {
       console.log(`[${label}] 未找到输入框，等待后重试 (${i}/${maxRetries})`);
       await sleep(1000);
       continue;
     }
 
     try {
-      // 点击聚焦，三击全选已有内容
-      await el.click({ clickCount: 3 });
-      await page.keyboard.press('Backspace');
-      await sleep(150);
+      await injectValue(page, selector, text);
 
-      // 逐字输入，带随机延迟，更接近真实输入，也降低被打断概率
-      await el.type(text, { delay: 60 + Math.floor(Math.random() * 40) });
-      await sleep(400);
+      const val1 = await page.$eval(selector, e => e.value).catch(() => null);
+      await sleep(300);
+      const val2 = await page.$eval(selector, e => e.value).catch(() => null);
 
-      // 校验实际值
-      const actualValue = await page.$eval(selector, e => e.value).catch(() => null);
-
-      if (actualValue === text) {
-        console.log(`[${label}] 输入校验通过 ✅`);
+      if (val1 === text && val2 === text) {
+        console.log(`[${label}] 注入并二次校验通过 ✅`);
         return true;
       } else {
-        console.log(`[${label}] 第 ${i} 次输入不完整/不匹配，期望长度 ${text.length}，实际内容: "${actualValue}"，正在重试...`);
-        await sleep(800);
+        console.log(`[${label}] 第 ${i} 次注入后校验未通过（第一次读到: "${val1}"，300ms 后读到: "${val2}"，期望: "${text}"），重试...`);
+        await sleep(600);
       }
     } catch (err) {
-      console.log(`[${label}] 输入过程中出现异常（可能是元素被重新渲染）: ${err.message}，重试中...`);
+      console.log(`[${label}] 注入过程中出现异常: ${err.message}，重试中...`);
       await sleep(1000);
     }
   }
+
+  // 兜底方案：逐字模拟打字（延迟更长），以防站点对 input 事件来源有额外校验
+  console.log(`[${label}] JS 注入方式多次失败，尝试兜底的逐字打字方式...`);
+  for (let i = 1; i <= 3; i++) {
+    const el = await page.$(selector);
+    if (!el) { await sleep(1000); continue; }
+    try {
+      await el.click({ clickCount: 3 });
+      await page.keyboard.press('Backspace');
+      await sleep(200);
+      await el.type(text, { delay: 150 });
+      await sleep(500);
+      const actualValue = await page.$eval(selector, e => e.value).catch(() => null);
+      if (actualValue === text) {
+        console.log(`[${label}] 兜底逐字打字校验通过 ✅`);
+        return true;
+      }
+      console.log(`[${label}] 兜底方式第 ${i} 次仍不匹配，实际内容: "${actualValue}"`);
+    } catch (err) {
+      console.log(`[${label}] 兜底打字异常: ${err.message}`);
+    }
+    await sleep(800);
+  }
+
   return false;
 }
 
@@ -165,6 +209,21 @@ async function run() {
     // 等待 CF 自动验证（Turnstile）完成
     console.log('等待 Cloudflare 验证通过...');
     await sleep(6000);
+
+    // 提交前最后一次校验：如果这段等待期间值又被改动了，立刻重新注入一次，
+    // 尽量缩短"确认无误"到"点击提交"之间的时间窗口。
+    const emailValBeforeSubmit = await page.$eval(EMAIL_SELECTOR, e => e.value).catch(() => null);
+    const pwdValBeforeSubmit = await page.$eval(PASSWORD_SELECTOR, e => e.value).catch(() => null);
+    if (emailValBeforeSubmit !== EMAIL) {
+      console.log(`提交前发现邮箱值被改动（当前: "${emailValBeforeSubmit}"），重新注入...`);
+      await injectValue(page, EMAIL_SELECTOR, EMAIL);
+      await sleep(300);
+    }
+    if (pwdValBeforeSubmit !== PASSWORD) {
+      console.log('提交前发现密码值被改动，重新注入...');
+      await injectValue(page, PASSWORD_SELECTOR, PASSWORD);
+      await sleep(300);
+    }
 
     const submitBtn = await page.$('button[type="submit"]');
     if (submitBtn) {
