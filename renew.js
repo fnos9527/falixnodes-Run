@@ -18,6 +18,8 @@ if (!fs.existsSync(SCREENSHOT_DIR)) {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
 }
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // 辅助：解析 "108 hours 28 minutes 27 seconds" 为总秒数
 function parseTimeToSeconds(text) {
   if (!text) return 0;
@@ -43,6 +45,52 @@ async function extractTimerText(page) {
   }
 }
 
+/**
+ * 稳定输入函数：
+ * 1. 每次都重新查询元素（避免元素被重新渲染后引用失效）
+ * 2. 点击并全选、清空，再输入
+ * 3. 输入完成后立刻读取输入框实际的 value 进行比对
+ * 4. 如果不一致（比如只打进去了 "af"），自动清空重试，最多重试 maxRetries 次
+ * 这样即使页面在输入过程中因为 Cloudflare 验证/React 渲染导致输入被打断，
+ * 也能被检测出来并自动修正，而不是"打错了也不知道，直接往下走"。
+ */
+async function safeType(page, selector, text, { maxRetries = 6, label = '' } = {}) {
+  for (let i = 1; i <= maxRetries; i++) {
+    const el = await page.$(selector);
+    if (!el) {
+      console.log(`[${label}] 未找到输入框，等待后重试 (${i}/${maxRetries})`);
+      await sleep(1000);
+      continue;
+    }
+
+    try {
+      // 点击聚焦，三击全选已有内容
+      await el.click({ clickCount: 3 });
+      await page.keyboard.press('Backspace');
+      await sleep(150);
+
+      // 逐字输入，带随机延迟，更接近真实输入，也降低被打断概率
+      await el.type(text, { delay: 60 + Math.floor(Math.random() * 40) });
+      await sleep(400);
+
+      // 校验实际值
+      const actualValue = await page.$eval(selector, e => e.value).catch(() => null);
+
+      if (actualValue === text) {
+        console.log(`[${label}] 输入校验通过 ✅`);
+        return true;
+      } else {
+        console.log(`[${label}] 第 ${i} 次输入不完整/不匹配，期望长度 ${text.length}，实际内容: "${actualValue}"，正在重试...`);
+        await sleep(800);
+      }
+    } catch (err) {
+      console.log(`[${label}] 输入过程中出现异常（可能是元素被重新渲染）: ${err.message}，重试中...`);
+      await sleep(1000);
+    }
+  }
+  return false;
+}
+
 // 仅发送 Telegram 纯文字通知
 async function sendTelegramNotification(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
@@ -61,14 +109,13 @@ async function sendTelegramNotification(text) {
   }
 }
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
 async function run() {
   let initialTimeText = '未知';
   let finalTimeText = '未知';
   let initialSeconds = 0;
   let finalSeconds = 0;
   let isSuccess = false;
+  let loginSuccess = false;
 
   console.log('正在启动浏览器...');
   const browserArgs = [
@@ -95,13 +142,28 @@ async function run() {
     // 1. 登录
     console.log('正在访问登录页面...');
     await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 60000 });
-    await sleep(3000);
 
-    await page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="email" i]', { timeout: 15000 });
-    await page.type('input[type="email"], input[name="email"], input[placeholder*="email" i]', EMAIL);
-    await page.type('input[type="password"]', PASSWORD);
+    // 页面刚加载完成时，Cloudflare 验证脚本和前端框架（React/Vue 等）可能还在
+    // 初始化/重新渲染 DOM，过早输入很容易被打断（这正是截图里邮箱只剩 "af" 的原因）。
+    // 这里先多等一会，让页面彻底稳定下来。
+    await sleep(5000);
 
-    // 等待 CF 自动验证
+    const EMAIL_SELECTOR = 'input[type="email"], input[name="email"], input[placeholder*="email" i]';
+    const PASSWORD_SELECTOR = 'input[type="password"]';
+
+    await page.waitForSelector(EMAIL_SELECTOR, { timeout: 20000, visible: true });
+    await page.waitForSelector(PASSWORD_SELECTOR, { timeout: 20000, visible: true });
+
+    // 使用稳定输入函数，输入后自动校验+重试
+    const emailOk = await safeType(page, EMAIL_SELECTOR, EMAIL, { label: '邮箱' });
+    const passwordOk = await safeType(page, PASSWORD_SELECTOR, PASSWORD, { label: '密码' });
+
+    if (!emailOk || !passwordOk) {
+      console.log('⚠️ 邮箱或密码多次重试后仍未能正确输入，仍尝试继续流程（可能导致登录失败）。');
+    }
+
+    // 等待 CF 自动验证（Turnstile）完成
+    console.log('等待 Cloudflare 验证通过...');
     await sleep(6000);
 
     const submitBtn = await page.$('button[type="submit"]');
@@ -112,10 +174,16 @@ async function run() {
     }
 
     await sleep(8000);
+
     // 保存截图 1：登录结果（供 GitHub Artifacts 下载）
     const loginPic = path.join(SCREENSHOT_DIR, '01_login_result.png');
     await page.screenshot({ path: loginPic, fullPage: true });
     console.log('已保存关键截图 1：登录结果');
+
+    // 简单判断是否登录成功：登录后地址不再停留在 /auth/login
+    const currentUrl = page.url();
+    loginSuccess = !currentUrl.includes('/auth/login');
+    console.log(`登录后当前地址: ${currentUrl}，判定登录${loginSuccess ? '成功' : '失败'}`);
 
     // 2. 循环续期与重试（最多 3 次）
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -157,7 +225,7 @@ async function run() {
         console.log('已成功点击 [Add Time] 按钮，等待响应跳转...');
         await sleep(10000);
       } else {
-        console.log('未找到或无法点击 [Add Time] 按钮');
+        console.log('未找到或无法点击 [Add Time] 按钮（如果尚未登录成功，这里通常会失败）');
       }
 
       // 重新打开 Timer 页面确认时间是否增加
@@ -196,7 +264,8 @@ async function run() {
     const tgMessage = `
 <b>${statusEmoji} FalixNodes 续期${isSuccess ? '成功' : '失败'}通知</b>
 ——————————————
-<b>状态:</b> ${isSuccess ? '已成功续期（时间已增加）' : '重试 3 次后时间仍未增加'}
+<b>登录状态:</b> ${loginSuccess ? '成功' : '失败（请检查账号密码或截图）'}
+<b>续期状态:</b> ${isSuccess ? '已成功续期（时间已增加）' : '重试 3 次后时间仍未增加'}
 <b>续期前时间:</b> <code>${initialTimeText}</code>
 <b>续期后时间:</b> <code>${finalTimeText}</code>
 <b>服务器 ID:</b> <code>${SERVER_ID}</code>
