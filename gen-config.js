@@ -76,7 +76,7 @@ const config = {
   ],
   outbounds: [
     ...outbounds,
-    { type: 'urltest', tag: 'auto', outbounds: tags, url: 'https://www.gstatic.com/generate_204', interval: '1m' },
+    { type: 'urltest', tag: 'auto', outbounds: tags, url: 'https://www.cloudflare.com/cdn-cgi/trace', interval: '1m' },
     { type: 'direct', tag: 'direct' },
   ],
   route: {
