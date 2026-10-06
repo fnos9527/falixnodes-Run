@@ -55,29 +55,26 @@ jobs:
           pgrep -a sing-box || { echo "sing-box 进程不存在"; cat singbox.log; exit 1; }
 
           N=$(jq '[.outbounds[] | select(.type=="vless")] | length' config.json)
-          echo "=== 单节点测试 (共 $N 个) ==="
+          echo "=== 单节点测试 (共 $N 个), 目标: client.falixnodes.net ==="
           for i in $(seq 1 $N); do
             P=$((1080+i))
-            if R=$(curl -sS --max-time 15 --socks5-hostname 127.0.0.1:$P https://api.ipify.org 2>&1); then
-              echo "节点$i 可用, 出口IP: $R"
-            else
-              echo "节点$i 失败: $R"
-            fi
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 20 --socks5-hostname 127.0.0.1:$P https://client.falixnodes.net/auth/login 2>&1 || true)
+            echo "节点$i -> HTTP $CODE  (000/超时=无法访问Falix; 200/403/503=能连上)"
           done
 
           echo "=== 自动选路测试 (127.0.0.1:1080) ==="
-          for i in 1 2 3 4 5; do
-            for URL in https://api.ipify.org https://www.cloudflare.com/cdn-cgi/trace https://www.gstatic.com/generate_204; do
-              if R=$(curl -sS --max-time 15 --socks5-hostname 127.0.0.1:1080 "$URL" 2>&1); then
-                echo "代理可用 ($URL): $(echo "$R" | head -3)"
-                exit 0
-              else
-                echo "尝试失败 ($URL): $R"
-              fi
-            done
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 20 --socks5-hostname 127.0.0.1:1080 https://client.falixnodes.net/auth/login 2>/dev/null || true)
+            echo "第$i次: HTTP $CODE"
+            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
+              echo "代理可访问 Falix"
+              curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E "^(ip|loc|colo)=" || true
+              exit 0
+            fi
             sleep 3
           done
-          echo "代理测试失败, sing-box 日志:"; tail -60 singbox.log; exit 1
+          echo "所有节点都无法访问 Falix。若节点是 Cloudflare Workers 类型(带 ?ed=2048)，它无法访问 CF 托管的网站，请改用 VPS 直连节点。"
+          echo "--- sing-box 日志 ---"; tail -60 singbox.log; exit 1
 
       # ---- 执行续期 ----
       - name: 执行续期
