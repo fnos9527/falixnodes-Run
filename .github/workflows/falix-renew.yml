@@ -1,0 +1,85 @@
+name: Falix Auto Renew
+
+on:
+  schedule:
+    - cron: '17 2 * * *'   # 每天一次 (UTC 02:17 = 北京时间 10:17)
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 安装依赖 (xvfb + npm)
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y xvfb
+          npm install --no-audit --no-fund
+
+      # ---- 恢复上次保存的 Cookie ----
+      - name: 恢复 Cookie 缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: falix-data-${{ github.run_id }}
+          restore-keys: falix-data-
+
+      # ---- 安装并启动 sing-box ----
+      - name: 生成 sing-box 配置
+        env:
+          PROXY_LINKS: ${{ secrets.PROXY_LINKS }}
+        run: node gen-config.js
+
+      - name: 安装 sing-box
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | jq -r '.assets[].browser_download_url | select(test("linux-amd64\\.tar\\.gz$"))' | head -1)
+          echo "下载: $URL"
+          curl -L "$URL" -o sb.tar.gz
+          tar -xzf sb.tar.gz --strip-components=1 --wildcards '*/sing-box'
+          chmod +x sing-box
+          ./sing-box version
+
+      - name: 启动代理并测试
+        run: |
+          ./sing-box check -c config.json
+          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 5
+          for i in 1 2 3 4 5; do
+            curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org && echo " <- 代理出口IP" && exit 0
+            sleep 3
+          done
+          echo "代理测试失败"; cat singbox.log; exit 1
+
+      # ---- 执行续期 ----
+      - name: 执行续期
+        env:
+          FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+          FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SERVER_ID: ${{ vars.SERVER_ID || '2845100' }}
+        run: node renew.js
+
+      # ---- 保存 Cookie（失败也保存）----
+      - name: 保存 Cookie 缓存
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: falix-data-${{ github.run_id }}
+
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shots
+          path: shots/
+          if-no-files-found: ignore
