@@ -68,14 +68,21 @@ if (!outbounds.length) { console.error('没有可用的代理节点，请检查 
 
 const tags = outbounds.map(o => o.tag);
 const config = {
-  log: { level: 'warn' },
-  inbounds: [{ type: 'socks', tag: 'socks-in', listen: '127.0.0.1', listen_port: 1080 }],
+  log: { level: 'info' },
+  inbounds: [
+    { type: 'socks', tag: 'socks-in', listen: '127.0.0.1', listen_port: 1080 },
+    // 每个节点单独一个测试端口: 1081, 1082, ...
+    ...outbounds.map((o, i) => ({ type: 'socks', tag: `in-${i + 1}`, listen: '127.0.0.1', listen_port: 1081 + i })),
+  ],
   outbounds: [
     ...outbounds,
     { type: 'urltest', tag: 'auto', outbounds: tags, url: 'https://www.gstatic.com/generate_204', interval: '1m' },
     { type: 'direct', tag: 'direct' },
   ],
-  route: { final: 'auto' },
+  route: {
+    rules: outbounds.map((o, i) => ({ inbound: [`in-${i + 1}`], outbound: o.tag })),
+    final: 'auto',
+  },
 };
 fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
 console.log(`已生成 config.json，节点数: ${outbounds.length}`);
