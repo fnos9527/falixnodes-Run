@@ -54,6 +54,40 @@ async function debug(page, name, note) {
   } catch (e) { log('诊断失败', e.message); }
 }
 
+// 等待 Cloudflare 整页挑战(Just a moment...)结束；卡住则刷新一次
+async function waitCF(page, maxMs = 90000) {
+  const start = Date.now();
+  let reloaded = 0;
+  while (Date.now() - start < maxMs) {
+    const t = await page.title().catch(() => '');
+    const b = await page.evaluate(() => (document.body ? document.body.innerText.slice(0, 200) : '')).catch(() => '');
+    const challenge = /just a moment|attention required/i.test(t) || /verifying you are human|performing security verification/i.test(b);
+    if (!challenge) return true;
+    if (reloaded < 1 && Date.now() - start > 40000) {
+      reloaded++;
+      log('CF 挑战卡住，刷新页面重试');
+      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    }
+    await sleep(2000);
+  }
+  log('CF 挑战等待超时');
+  return false;
+}
+
+async function gotoCF(page, url) {
+  for (let i = 0; i < 2; i++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      break;
+    } catch (e) {
+      log(`打开 ${url} 失败(${e.message})${i === 0 ? '，重试' : ''}`);
+      if (i === 1) throw e;
+      await sleep(3000);
+    }
+  }
+  await waitCF(page);
+}
+
 // ---------- 工具函数 ----------
 function fmt(sec) {
   if (sec == null) return '未知';
@@ -113,7 +147,7 @@ async function loadCookies(page) {
 async function login(page) {
   if (!FALIX_EMAIL || !FALIX_PASSWORD) throw new Error('缺少 FALIX_EMAIL / FALIX_PASSWORD');
   log('开始账号密码登录');
-  await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  if (page.url().includes('/auth/login')) { await waitCF(page); } else { await gotoCF(page, LOGIN_URL); }
   const emailSel = 'input[type="email"], input[name="email"], input[autocomplete="username"], input:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"])';
   const passSel = 'input[type="password"]';
   let found = false;
@@ -174,7 +208,7 @@ async function clickAddTime(page) {
 
     // 1. 优先用 Cookie
     const hadCookie = await loadCookies(page);
-    await page.goto(TIMER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await gotoCF(page, TIMER_URL);
     await sleep(4000);
     await debug(page, 'first-load', '首次打开 timer 页的状态');
     if (page.url().includes('/auth/login')) {
@@ -191,9 +225,9 @@ async function clickAddTime(page) {
       result.attempts = attempt;
       log(`第 ${attempt} 次续期`);
       try {
-        await page.goto(TIMER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await gotoCF(page, TIMER_URL);
         await sleep(3000);
-        if (page.url().includes('/auth/login')) { await login(page); await page.goto(TIMER_URL, { waitUntil: 'domcontentloaded' }); }
+        if (page.url().includes('/auth/login')) { await login(page); await gotoCF(page, TIMER_URL); }
 
         const before = await getRemaining(page);
         if (result.before == null) result.before = before;
@@ -206,7 +240,7 @@ async function clickAddTime(page) {
         log('已点击 Add Time');
         await sleep(2500);
 
-        await page.goto(TIMER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await gotoCF(page, TIMER_URL);
         await sleep(3000);
         const after = await getRemaining(page);
         result.after = after;
