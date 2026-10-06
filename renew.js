@@ -41,6 +41,19 @@ async function shot(page, name, caption) {
   catch (e) { log('截图失败', e.message); }
 }
 
+// 失败诊断：截图 + 标题 + 正文摘要 + HTML，并发到 TG
+async function debug(page, name, note) {
+  try {
+    const title = await page.title().catch(() => '');
+    const body = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 300) : '').catch(() => '');
+    log(`[诊断:${name}] url=${page.url()} title=${title}`);
+    log(`[诊断:${name}] body=${body.replace(/\s+/g, ' ')}`);
+    const html = await page.content().catch(() => '');
+    fs.writeFileSync(`shots/${name}.html`, html);
+    await shot(page, name, `🔍 ${note}\nURL: ${page.url()}\n标题: ${title}\n正文: ${body.replace(/\s+/g, ' ').slice(0, 150)}`);
+  } catch (e) { log('诊断失败', e.message); }
+}
+
 // ---------- 工具函数 ----------
 function fmt(sec) {
   if (sec == null) return '未知';
@@ -101,10 +114,17 @@ async function login(page) {
   if (!FALIX_EMAIL || !FALIX_PASSWORD) throw new Error('缺少 FALIX_EMAIL / FALIX_PASSWORD');
   log('开始账号密码登录');
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 60000 });
-  await sleep(1500);
-  const emailSel = 'input[type="email"], input[name="email"]';
+  const emailSel = 'input[type="email"], input[name="email"], input[autocomplete="username"], input:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"])';
   const passSel = 'input[type="password"]';
+  let found = false;
+  for (let i = 0; i < 60; i++) {
+    found = await page.evaluate((sel) => !!document.querySelector(sel), emailSel).catch(() => false);
+    if (found) break;
+    if (i === 15) await debug(page, 'login-wait-15s', '登录页 15 秒仍无输入框');
+    await sleep(1000);
+  }
+  if (!found) { await debug(page, 'login-no-input', '登录页找不到输入框'); throw new Error('登录页找不到输入框'); }
+  await sleep(1500);
   await page.click(emailSel); await page.type(emailSel, FALIX_EMAIL, { delay: 60 });
   await page.click(passSel); await page.type(passSel, FALIX_PASSWORD, { delay: 60 });
   log('等待 CF 验证…');
@@ -122,7 +142,7 @@ async function login(page) {
   await sleep(2000);
   const success = !page.url().includes('/auth/login');
   await shot(page, 'login', success ? '✅ 登录成功截图' : '❌ 登录失败截图');
-  if (!success) throw new Error('登录失败，仍停留在登录页');
+  if (!success) { await debug(page, 'login-failed', '登录后仍在登录页'); throw new Error('登录失败，仍停留在登录页'); }
   await saveCookies(page);
 }
 
@@ -138,7 +158,7 @@ async function clickAddTime(page) {
 
 // ---------- 主流程 ----------
 (async () => {
-  let browser;
+  let browser, page;
   const result = { before: null, after: null, attempts: 0, ok: false, error: null };
   try {
     const conn = await connect({
@@ -149,13 +169,14 @@ async function clickAddTime(page) {
       args: [`--proxy-server=${PROXY}`, '--window-size=1280,900', '--no-sandbox'],
     });
     browser = conn.browser;
-    const page = conn.page;
+    page = conn.page;
     await page.setViewport({ width: 1280, height: 900 });
 
     // 1. 优先用 Cookie
     const hadCookie = await loadCookies(page);
     await page.goto(TIMER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await sleep(4000);
+    await debug(page, 'first-load', '首次打开 timer 页的状态');
     if (page.url().includes('/auth/login')) {
       log(hadCookie ? 'Cookie 已失效，改用账号密码' : '无 Cookie，使用账号密码');
       await login(page);
@@ -199,6 +220,7 @@ async function clickAddTime(page) {
         log('时间未增加，准备重试');
       } catch (e) {
         log(`第 ${attempt} 次出错:`, e.message);
+        await debug(page, `attempt-${attempt}-error`, `第 ${attempt} 次出错: ${e.message}`);
         result.error = e.message;
       }
     }
@@ -206,6 +228,7 @@ async function clickAddTime(page) {
   } catch (e) {
     result.error = e.message;
     log('致命错误:', e.message);
+    if (page) await debug(page, 'fatal', '致命错误: ' + e.message);
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
