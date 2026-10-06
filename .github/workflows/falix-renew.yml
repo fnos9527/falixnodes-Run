@@ -51,12 +51,33 @@ jobs:
         run: |
           ./sing-box check -c config.json
           nohup ./sing-box run -c config.json > singbox.log 2>&1 &
-          sleep 5
+          sleep 8
+          pgrep -a sing-box || { echo "sing-box 进程不存在"; cat singbox.log; exit 1; }
+
+          N=$(jq '[.outbounds[] | select(.type=="vless")] | length' config.json)
+          echo "=== 单节点测试 (共 $N 个) ==="
+          for i in $(seq 1 $N); do
+            P=$((1080+i))
+            if R=$(curl -sS --max-time 15 --socks5-hostname 127.0.0.1:$P https://api.ipify.org 2>&1); then
+              echo "节点$i 可用, 出口IP: $R"
+            else
+              echo "节点$i 失败: $R"
+            fi
+          done
+
+          echo "=== 自动选路测试 (127.0.0.1:1080) ==="
           for i in 1 2 3 4 5; do
-            curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org && echo " <- 代理出口IP" && exit 0
+            for URL in https://api.ipify.org https://www.cloudflare.com/cdn-cgi/trace https://www.gstatic.com/generate_204; do
+              if R=$(curl -sS --max-time 15 --socks5-hostname 127.0.0.1:1080 "$URL" 2>&1); then
+                echo "代理可用 ($URL): $(echo "$R" | head -3)"
+                exit 0
+              else
+                echo "尝试失败 ($URL): $R"
+              fi
+            done
             sleep 3
           done
-          echo "代理测试失败"; cat singbox.log; exit 1
+          echo "代理测试失败, sing-box 日志:"; tail -60 singbox.log; exit 1
 
       # ---- 执行续期 ----
       - name: 执行续期
