@@ -26,19 +26,27 @@ async function tgText(text) {
   } catch (e) { log('TG 文字发送失败', e.message); }
 }
 async function tgPhoto(file, caption) {
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return false;
   try {
     const fd = new FormData();
     fd.append('chat_id', TG_CHAT_ID);
-    fd.append('caption', caption);
+    fd.append('caption', caption.slice(0, 1000));
     fd.append('photo', new Blob([fs.readFileSync(file)]), 'shot.png');
-    await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, { method: 'POST', body: fd });
-  } catch (e) { log('TG 图片发送失败', e.message); }
+    const r = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, { method: 'POST', body: fd });
+    return r.ok;
+  } catch (e) { log('TG 图片发送失败', e.message); return false; }
 }
-async function shot(page, name, caption) {
+// 截图只保存到 shots/，不发送
+let lastShot = null;
+async function shot(page, name) {
   const file = `shots/${name}.png`;
-  try { await page.screenshot({ path: file }); await tgPhoto(file, caption); }
+  try { await page.screenshot({ path: file }); lastShot = file; }
   catch (e) { log('截图失败', e.message); }
+}
+// 全流程只发一条 TG：有截图就发「截图+文字」，否则发文字
+async function tgFinal(msg) {
+  if (lastShot && fs.existsSync(lastShot) && await tgPhoto(lastShot, msg)) return;
+  await tgText(msg);
 }
 
 // 失败诊断：截图 + 标题 + 正文摘要 + HTML，并发到 TG
@@ -164,16 +172,9 @@ async function setValue(page, sel, val) {
   return false;
 }
 
-// 等待 Turnstile token；失败则重置，最多 3 轮
+// 等待 Turnstile token（不干预页面，由 turnstile:true 自动点击）
 async function solveTurnstile(page) {
-  for (let round = 1; round <= 3; round++) {
-    const ok = await waitTurnstile(page, 30000);
-    if (ok) return true;
-    log(`Turnstile 第 ${round} 轮未通过，尝试重置`);
-    await page.evaluate(() => { try { window.turnstile && window.turnstile.reset(); } catch (e) {} }).catch(() => {});
-    await sleep(3000);
-  }
-  return false;
+  return waitTurnstile(page, 45000);
 }
 
 async function login(page) {
@@ -197,18 +198,14 @@ async function login(page) {
     if (!found) { await debug(page, `login-no-input-${attempt}`, '登录页找不到输入框'); continue; }
     await sleep(3000); // 等页面和验证框渲染稳定
 
-    const fill = async () => {
-      const a = await setValue(page, emailSel, email);
-      const b = await setValue(page, passSel, pass);
-      log(`邮箱填写${a ? '成功' : '失败'}(长度 ${email.length})，密码填写${b ? '成功' : '失败'}(长度 ${pass.length})`);
-      return a && b;
-    };
-    await fill();
-
     log('等待 CF 验证…');
     const ok = await solveTurnstile(page);
     log('CF 验证结果:', ok);
-    await fill(); // 验证重置后表单可能被重渲染，重新确认
+    if (!ok) { await debug(page, `login-turnstile-failed-${attempt}`, `第 ${attempt} 轮 Turnstile 未通过`); continue; }
+
+    const a1 = await setValue(page, emailSel, email);
+    const b1 = await setValue(page, passSel, pass);
+    log(`邮箱填写${a1 ? '成功' : '失败'}(长度 ${email.length})，密码填写${b1 ? '成功' : '失败'}(长度 ${pass.length})`);
 
     await page.evaluate(() => {
       const btns = [...document.querySelectorAll('button')];
@@ -250,11 +247,10 @@ async function clickAddTime(page) {
       turnstile: true,
       disableXvfb: false,
       ignoreAllFlags: false,
-      args: [`--proxy-server=${PROXY}`, '--window-size=1280,900', '--no-sandbox'],
+      args: [`--proxy-server=${PROXY}`, '--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--webrtc-ip-handling-policy=disable_non_proxied_udp'],
     });
     browser = conn.browser;
     page = conn.page;
-    await page.setViewport({ width: 1280, height: 900 });
 
     // 1. 优先用 Cookie
     const hadCookie = await loadCookies(page);
@@ -321,6 +317,6 @@ async function clickAddTime(page) {
     ? `✅ FalixNodes 续期成功\n服务器ID: ${SERVER_ID}\n续期前: ${fmt(result.before)}\n续期后: ${fmt(result.after)}\n尝试次数: ${result.attempts}`
     : `❌ FalixNodes 续期失败\n服务器ID: ${SERVER_ID}\n续期前: ${fmt(result.before)}\n最后读取: ${fmt(result.after)}\n尝试次数: ${result.attempts}\n错误: ${result.error || '时间未增加'}`;
   log(msg);
-  await tgText(msg);
+  await tgFinal(msg);
   process.exit(result.ok ? 0 : 1);
 })();
