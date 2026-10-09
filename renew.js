@@ -144,40 +144,90 @@ async function loadCookies(page) {
   } catch (e) { log('加载 Cookie 失败', e.message); return false; }
 }
 
+// 直接赋值(不依赖焦点，不会被 turnstile 的后台点击打断)，并回读校验
+async function setValue(page, sel, val) {
+  for (let i = 0; i < 3; i++) {
+    await page.evaluate((sel, val) => {
+      const el = document.querySelector(sel);
+      if (!el) return;
+      el.focus();
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, val);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+    }, sel, val).catch(() => {});
+    const cur = await page.evaluate((sel) => (document.querySelector(sel) || {}).value, sel).catch(() => null);
+    if (cur === val) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+// 等待 Turnstile token；失败则重置，最多 3 轮
+async function solveTurnstile(page) {
+  for (let round = 1; round <= 3; round++) {
+    const ok = await waitTurnstile(page, 30000);
+    if (ok) return true;
+    log(`Turnstile 第 ${round} 轮未通过，尝试重置`);
+    await page.evaluate(() => { try { window.turnstile && window.turnstile.reset(); } catch (e) {} }).catch(() => {});
+    await sleep(3000);
+  }
+  return false;
+}
+
 async function login(page) {
   if (!FALIX_EMAIL || !FALIX_PASSWORD) throw new Error('缺少 FALIX_EMAIL / FALIX_PASSWORD');
-  log('开始账号密码登录');
-  if (page.url().includes('/auth/login')) { await waitCF(page); } else { await gotoCF(page, LOGIN_URL); }
+  const email = FALIX_EMAIL.replace(/[\r\n]+$/g, '');
+  const pass = FALIX_PASSWORD.replace(/[\r\n]+$/g, '');
   const emailSel = 'input[type="email"], input[name="email"], input[autocomplete="username"], input:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"])';
   const passSel = 'input[type="password"]';
-  let found = false;
-  for (let i = 0; i < 60; i++) {
-    found = await page.evaluate((sel) => !!document.querySelector(sel), emailSel).catch(() => false);
-    if (found) break;
-    if (i === 15) await debug(page, 'login-wait-15s', '登录页 15 秒仍无输入框');
-    await sleep(1000);
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    log(`账号密码登录，第 ${attempt} 轮`);
+    if (attempt === 1 && page.url().includes('/auth/login')) await waitCF(page);
+    else await gotoCF(page, LOGIN_URL);
+
+    let found = false;
+    for (let i = 0; i < 60; i++) {
+      found = await page.evaluate((sel) => !!document.querySelector(sel), emailSel).catch(() => false);
+      if (found) break;
+      await sleep(1000);
+    }
+    if (!found) { await debug(page, `login-no-input-${attempt}`, '登录页找不到输入框'); continue; }
+    await sleep(3000); // 等页面和验证框渲染稳定
+
+    const fill = async () => {
+      const a = await setValue(page, emailSel, email);
+      const b = await setValue(page, passSel, pass);
+      log(`邮箱填写${a ? '成功' : '失败'}(长度 ${email.length})，密码填写${b ? '成功' : '失败'}(长度 ${pass.length})`);
+      return a && b;
+    };
+    await fill();
+
+    log('等待 CF 验证…');
+    const ok = await solveTurnstile(page);
+    log('CF 验证结果:', ok);
+    await fill(); // 验证重置后表单可能被重渲染，重新确认
+
+    await page.evaluate(() => {
+      const btns = [...document.querySelectorAll('button')];
+      const btn = btns.find((b) => /^sign\s*in$/i.test(b.innerText.trim())) || btns.find((b) => b.type === 'submit');
+      if (btn) btn.click();
+    });
+    for (let i = 0; i < 30; i++) {
+      await sleep(1000);
+      if (!page.url().includes('/auth/login')) break;
+    }
+    await sleep(2000);
+    if (!page.url().includes('/auth/login')) {
+      await shot(page, 'login', '✅ 登录成功截图');
+      await saveCookies(page);
+      return;
+    }
+    await debug(page, `login-failed-${attempt}`, `第 ${attempt} 轮登录失败`);
   }
-  if (!found) { await debug(page, 'login-no-input', '登录页找不到输入框'); throw new Error('登录页找不到输入框'); }
-  await sleep(1500);
-  await page.click(emailSel); await page.type(emailSel, FALIX_EMAIL, { delay: 60 });
-  await page.click(passSel); await page.type(passSel, FALIX_PASSWORD, { delay: 60 });
-  log('等待 CF 验证…');
-  const ok = await waitTurnstile(page, 60000);
-  log('CF 验证结果:', ok);
-  await page.evaluate(() => {
-    const btn = [...document.querySelectorAll('button')].find((b) => /sign\s*in/i.test(b.innerText) && b.type !== 'button') ||
-                [...document.querySelectorAll('button')].find((b) => /^sign\s*in$/i.test(b.innerText.trim()));
-    if (btn) btn.click();
-  });
-  for (let i = 0; i < 30; i++) {
-    await sleep(1000);
-    if (!page.url().includes('/auth/login')) break;
-  }
-  await sleep(2000);
-  const success = !page.url().includes('/auth/login');
-  await shot(page, 'login', success ? '✅ 登录成功截图' : '❌ 登录失败截图');
-  if (!success) { await debug(page, 'login-failed', '登录后仍在登录页'); throw new Error('登录失败，仍停留在登录页'); }
-  await saveCookies(page);
+  throw new Error('登录失败，3 轮均停留在登录页');
 }
 
 async function clickAddTime(page) {
