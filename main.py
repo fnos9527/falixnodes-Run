@@ -4,6 +4,7 @@ import re
 import subprocess
 import time
 import urllib.parse
+import urllib.request
 from playwright.sync_api import sync_playwright
 import requests
 
@@ -81,8 +82,6 @@ def setup_sing_box(vless_url):
 
   # 测试代理连通性
   try:
-    import urllib.request
-
     proxy_handler = urllib.request.ProxyHandler(
         {'http': 'socks5://127.0.0.1:10808', 'https': 'socks5://127.0.0.1:10808'}
     )
