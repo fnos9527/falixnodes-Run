@@ -2,8 +2,8 @@ name: FalixNodes Auto Renew
 
 on:
   schedule:
-    - cron: '30 2 * * *' # 每天国际时间 02:30 运行一次 (可自行修改)
-  workflow_dispatch: # 支持手动一键触发
+    - cron: '30 2 * * *' # 每天国际时间 02:30 运行一次
+  workflow_dispatch: # 支持手动触发
 
 jobs:
   renew:
@@ -21,7 +21,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install playwright requests playwright-stealth
+          pip install playwright requests
           playwright install chromium
 
       - name: 恢复 Cookie 缓存
@@ -49,6 +49,5 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TIMER_URL: 'https://client.falixnodes.net/timer?id=2845100'
         run: |
-          # 安装虚拟显示屏 Xvfb，用于配合无头/有头浏览器绕过 Cloudflare
           sudo apt-get update && sudo apt-get install -y xvfb
           xvfb-run --auto-servernum python main.py
