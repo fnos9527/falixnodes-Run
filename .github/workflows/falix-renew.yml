@@ -1,0 +1,111 @@
+name: Falix Auto Renew
+
+on:
+  schedule:
+    - cron: "17 2 * * *"   # 每天 UTC 02:17 (悉尼/北京时间请自行换算)
+  workflow_dispatch:
+
+concurrency:
+  group: falix-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+      FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+      FALIX_TIMER_URL: ${{ secrets.FALIX_TIMER_URL }}   # 可选，默认 https://client.falixnodes.net/timer?id=2845100
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      SOCKS_PORT: "1080"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y xvfb jq
+          pip install seleniumbase requests
+
+      # ---------- 恢复上次保存的登录 Cookie ----------
+      - name: Restore cookies
+        uses: actions/cache/restore@v4
+        with:
+          path: cookies
+          key: falix-cookies-none          # 故意不命中，靠 restore-keys 取最新
+          restore-keys: |
+            falix-cookies-
+
+      # ---------- 可选 VLESS 代理 ----------
+      - name: Setup optional VLESS node
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          if [ -z "$NODE_LINK" ]; then
+            echo "NODE_LINK 为空，全程直连"
+            echo "IS_PROXY=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          WORK="$RUNNER_TEMP/singbox"
+          mkdir -p "$WORK"
+          echo "SINGBOX_DIR=$WORK" >> "$GITHUB_ENV"
+
+          url=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+                | jq -r '.assets[].browser_download_url | select(test("linux-amd64\\.tar\\.gz$"))' | head -n1)
+          curl -fsSL "$url" -o "$WORK/sb.tar.gz"
+          tar -xzf "$WORK/sb.tar.gz" -C "$WORK"
+          BIN=$(find "$WORK" -type f -name sing-box | head -n1)
+          chmod +x "$BIN"
+
+          if ! python scripts/gen_singbox.py "$NODE_LINK" "$SOCKS_PORT" > "$WORK/config.json"; then
+            echo "节点链接解析失败，改为直连"
+            echo "IS_PROXY=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          nohup "$BIN" run -c "$WORK/config.json" > "$WORK/singbox.log" 2>&1 &
+          sleep 4
+
+          if curl -fsS --max-time 20 --socks5-hostname 127.0.0.1:$SOCKS_PORT https://api.ipify.org >/dev/null; then
+            echo "代理可用: socks5://127.0.0.1:$SOCKS_PORT"
+            echo "IS_PROXY=true" >> "$GITHUB_ENV"
+          else
+            echo "代理不可用，改为直连"
+            tail -n 20 "$WORK/singbox.log" || true
+            pkill -9 sing-box || true
+            echo "IS_PROXY=false" >> "$GITHUB_ENV"
+          fi
+
+      # ---------- 续期 ----------
+      - name: Renew
+        run: python scripts/renew.py
+
+      - name: Save cookies
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cookies
+          key: falix-cookies-${{ github.run_id }}
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: "*.png"
+          if-no-files-found: ignore
+
+      # ---------- 清理 ----------
+      - name: Cleanup proxy
+        if: always()
+        run: |
+          pkill -9 sing-box || true
+          rm -rf "$RUNNER_TEMP/singbox" || true
