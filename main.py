@@ -63,7 +63,7 @@ def setup_sing_box(vless_url):
   if trans_type == 'ws':
     path = query.get('path', ['/'])[0]
     path = urllib.parse.unquote(path)
-    ws_host = query.get('host', [host])[0]
+    ws_host = query.get('host', [host]][0] if isinstance(query.get('host'), list) else host
     outbound['transport'] = {'type': 'ws', 'path': path, 'headers': {'Host': ws_host}}
 
   config = {
@@ -78,6 +78,19 @@ def setup_sing_box(vless_url):
   subprocess.Popen(['./sing-box', 'run', '-c', 'config.json'])
   time.sleep(3)
   print('sing-box 代理启动成功.')
+
+  # 测试代理连通性
+  try:
+    import urllib.request
+
+    proxy_handler = urllib.request.ProxyHandler(
+        {'http': 'socks5://127.0.0.1:10808', 'https': 'socks5://127.0.0.1:10808'}
+    )
+    opener = urllib.request.build_opener(proxy_handler)
+    res = opener.open('https://client.falixnodes.net', timeout=10)
+    print(f'代理连通性测试成功！目标响应状态码: {res.getcode()}')
+  except Exception as e:
+    print(f'⚠️ 警告: 通过代理访问目标网站失败，可能是节点失效或配置不匹配: {e}')
 
 
 def parse_time_to_seconds(time_str):
@@ -138,7 +151,8 @@ def main():
 
     try:
       print('正在访问登录页面...')
-      page.goto('https://client.falixnodes.net/auth/login', wait_until='networkidle')
+      # 改用 domcontentloaded 避免被永久挂起的网络请求导致超长等待
+      page.goto('https://client.falixnodes.net/auth/login', wait_until='domcontentloaded', timeout=60000)
       time.sleep(3)
 
       if 'auth/login' in page.url:
@@ -159,9 +173,10 @@ def main():
 
         time.sleep(5)
 
+      # 无论成功与否，都尝试截图留痕
       screenshot_path = 'login_success.png'
       page.screenshot(path=screenshot_path)
-      send_tg_message('🔄 FalixNodes 登录动作执行完成，当前登录状态截图：', screenshot_path)
+      send_tg_message('🔄 FalixNodes 登录动作执行完成，当前页面截图：', screenshot_path)
 
       new_cookies = context.cookies()
       with open(cookie_file, 'w') as f:
@@ -170,7 +185,7 @@ def main():
       success = False
       for attempt in range(1, 4):
         print(f'=== 第 {attempt} 次尝试续期 ===')
-        page.goto(timer_url, wait_until='networkidle')
+        page.goto(timer_url, wait_until='domcontentloaded', timeout=60000)
         time.sleep(4)
 
         try:
@@ -181,6 +196,7 @@ def main():
         except Exception as e:
           print(f'获取时间失败: {e}')
           page.screenshot(path=f'error_attempt_{attempt}.png')
+          send_tg_message(f'第 {attempt} 次尝试：未找到时间元素，页面截图如下：', f'error_attempt_{attempt}.png')
           continue
 
         try:
@@ -192,7 +208,7 @@ def main():
           print(f'点击 Add Time 按钮失败: {e}')
           continue
 
-        page.goto(timer_url, wait_until='networkidle')
+        page.goto(timer_url, wait_until='domcontentloaded', timeout=60000)
         time.sleep(3)
 
         try:
@@ -220,8 +236,11 @@ def main():
     except Exception as e:
       err_msg = f'❌ 脚本运行发生异常: {str(e)}'
       print(err_msg)
-      page.screenshot(path='fatal_error.png')
-      send_tg_message(err_msg, 'fatal_error.png')
+      try:
+        page.screenshot(path='fatal_error.png')
+        send_tg_message(err_msg, 'fatal_error.png')
+      except Exception:
+        send_tg_message(err_msg)
     finally:
       browser.close()
 
