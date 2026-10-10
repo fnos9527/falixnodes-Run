@@ -1,0 +1,54 @@
+name: FalixNodes Auto Renew
+
+on:
+  schedule:
+    - cron: '30 2 * * *' # 每天国际时间 02:30 运行一次 (可自行修改)
+  workflow_dispatch: # 支持手动一键触发
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright requests playwright-stealth
+          playwright install chromium
+
+      - name: 恢复 Cookie 缓存
+        uses: actions/cache@v4
+        with:
+          path: cookies.json
+          key: falix-cookies-${{ github.run_id }}
+          restore-keys: |
+            falix-cookies-
+
+      - name: 下载并解压 sing-box
+        run: |
+          VERSION="1.8.10"
+          wget https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-amd64.tar.gz
+          tar -zxvf sing-box-${VERSION}-linux-amd64.tar.gz
+          mv sing-box-${VERSION}-linux-amd64/sing-box ./sing-box
+          chmod +x ./sing-box
+
+      - name: 运行自动化续期脚本
+        env:
+          FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+          FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TIMER_URL: 'https://client.falixnodes.net/timer?id=2845100'
+        run: |
+          # 安装虚拟显示屏 Xvfb，用于配合无头/有头浏览器绕过 Cloudflare
+          sudo apt-get update && sudo apt-get install -y xvfb
+          xvfb-run --auto-servernum python main.py
