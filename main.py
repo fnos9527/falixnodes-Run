@@ -5,7 +5,6 @@ import subprocess
 import time
 import urllib.parse
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 import requests
 
 
@@ -76,7 +75,6 @@ def setup_sing_box(vless_url):
   with open('config.json', 'w') as f:
     json.dump(config, f, indent=2)
 
-  # 启动 sing-box 进程
   subprocess.Popen(['./sing-box', 'run', '-c', 'config.json'])
   time.sleep(3)
   print('sing-box 代理启动成功.')
@@ -114,7 +112,7 @@ def main():
 
   with sync_playwright() as p:
     browser = p.chromium.launch(
-        headless=False,  # 配合 xvfb 使用虚拟图形界面
+        headless=False,
         proxy={'server': 'socks5://127.0.0.1:10808'},
         args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
     )
@@ -126,7 +124,6 @@ def main():
         viewport={'width': 1280, 'height': 800},
     )
 
-    # 加载历史 Cookie
     cookie_file = 'cookies.json'
     if os.path.exists(cookie_file):
       try:
@@ -138,14 +135,12 @@ def main():
         print(f'加载 Cookie 失败: {e}')
 
     page = context.new_page()
-    stealth_sync(page)  # 注入防检测脚本
 
     try:
       print('正在访问登录页面...')
       page.goto('https://client.falixnodes.net/auth/login', wait_until='networkidle')
       time.sleep(3)
 
-      # 检查是否需要登录
       if 'auth/login' in page.url:
         print('检测到未登录或 Cookie 失效，开始账号密码登录...')
         if not email or not password:
@@ -155,9 +150,8 @@ def main():
         page.fill('input[type="password"]', password)
 
         print('等待处理 Cloudflare 验证，请稍候...')
-        time.sleep(6)  # 留出时间应对 CF 自动或手动验证
+        time.sleep(6)
 
-        # 点击登录按钮
         try:
           page.click('button:has-text("Sign In")')
         except Exception:
@@ -165,17 +159,14 @@ def main():
 
         time.sleep(5)
 
-      # 登录截图并发送
       screenshot_path = 'login_success.png'
       page.screenshot(path=screenshot_path)
       send_tg_message('🔄 FalixNodes 登录动作执行完成，当前登录状态截图：', screenshot_path)
 
-      # 保存最新 Cookie
       new_cookies = context.cookies()
       with open(cookie_file, 'w') as f:
         json.dump(new_cookies, f)
 
-      # 进入计时器页面进行续期
       success = False
       for attempt in range(1, 4):
         print(f'=== 第 {attempt} 次尝试续期 ===')
@@ -183,7 +174,6 @@ def main():
         time.sleep(4)
 
         try:
-          # 获取当前时间文本
           timer_element = page.locator('text=/\\d+\\s*(hours|days)/i').first
           old_time_str = timer_element.inner_text()
           old_seconds = parse_time_to_seconds(old_time_str)
@@ -193,7 +183,6 @@ def main():
           page.screenshot(path=f'error_attempt_{attempt}.png')
           continue
 
-        # 点击 + Add Time 按钮
         try:
           add_btn = page.locator('button:has-text("Add Time")')
           add_btn.click()
@@ -203,7 +192,6 @@ def main():
           print(f'点击 Add Time 按钮失败: {e}')
           continue
 
-        # 刷新并重新检查时间
         page.goto(timer_url, wait_until='networkidle')
         time.sleep(3)
 
