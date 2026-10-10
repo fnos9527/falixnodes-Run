@@ -63,7 +63,7 @@ def setup_sing_box(vless_url):
   if trans_type == 'ws':
     path = query.get('path', ['/'])[0]
     path = urllib.parse.unquote(path)
-    ws_host = query.get('host', [host]][0] if isinstance(query.get('host'), list) else host
+    ws_host = query.get('host', [host])[0]
     outbound['transport'] = {'type': 'ws', 'path': path, 'headers': {'Host': ws_host}}
 
   config = {
@@ -151,7 +151,6 @@ def main():
 
     try:
       print('正在访问登录页面...')
-      # 改用 domcontentloaded 避免被永久挂起的网络请求导致超长等待
       page.goto('https://client.falixnodes.net/auth/login', wait_until='domcontentloaded', timeout=60000)
       time.sleep(3)
 
@@ -173,7 +172,6 @@ def main():
 
         time.sleep(5)
 
-      # 无论成功与否，都尝试截图留痕
       screenshot_path = 'login_success.png'
       page.screenshot(path=screenshot_path)
       send_tg_message('🔄 FalixNodes 登录动作执行完成，当前页面截图：', screenshot_path)
