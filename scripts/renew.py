@@ -19,6 +19,10 @@ TG_CHAT = os.getenv("TG_CHAT_ID", "")
 IS_PROXY = os.getenv("IS_PROXY", "false").lower() == "true"
 PROXY = f"socks5://127.0.0.1:{os.getenv('SOCKS_PORT', '1080')}" if IS_PROXY else None
 
+LOWER = 'translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")'
+ADD_TIME_XPATH = f'//button[contains({LOWER}, "add time")]'
+SIGN_IN_XPATH = f'//button[contains({LOWER}, "sign in") and not(contains({LOWER}, "passkey"))]'
+
 
 def tg(text: str):
     print(text)
@@ -42,7 +46,7 @@ def fmt(sec: int) -> str:
 
 
 def read_timer(sb) -> int:
-    """从页面读取剩余时间(秒)，格式如 '153 hours 34 minutes 37 seconds'。"""
+    """从页面读取剩余时间(秒)，格式如 '143 hours 31 minutes 14 seconds'。"""
     deadline = time.time() + 30
     while time.time() < deadline:
         text = sb.get_text("body")
@@ -57,6 +61,11 @@ def read_timer(sb) -> int:
 def solve_turnstile(sb) -> bool:
     js = "var e=document.querySelector('[name=cf-turnstile-response]');return e?e.value:''"
     for _ in range(3):
+        try:
+            if sb.execute_script(js):  # 已自动通过
+                return True
+        except Exception:
+            pass
         try:
             sb.uc_gui_click_captcha()
         except Exception as e:
@@ -108,7 +117,8 @@ def do_login(sb):
     try:
         sb.click('button[type="submit"]', timeout=5)
     except Exception:
-        sb.click('button:contains("Sign In")')
+        sb.wait_for_element(SIGN_IN_XPATH, by="xpath", timeout=10)
+        sb.click(SIGN_IN_XPATH, by="xpath")
     for _ in range(40):
         if "/auth/login" not in sb.get_current_url():
             return
@@ -140,7 +150,10 @@ def main():
 
             if not solve_turnstile(sb):
                 raise RuntimeError("续期页 CF 验证未通过")
-            sb.click('button:contains("Add Time")')
+
+            # 按钮文字是 "Add time"（大小写不固定），用不区分大小写的 XPath
+            sb.wait_for_element(ADD_TIME_XPATH, by="xpath", timeout=20)
+            sb.click(ADD_TIME_XPATH, by="xpath")
 
             # 等待跳转回服务器页面
             for _ in range(45):
