@@ -2,7 +2,7 @@ name: Falix Auto Renew
 
 on:
   schedule:
-    - cron: "17 2 * * *"   # 每天 UTC 02:17 (悉尼/北京时间请自行换算)
+    - cron: "0 19 * * *"   # 每天 UTC 02:17 (悉尼/北京时间请自行换算)
   workflow_dispatch:
 
 concurrency:
