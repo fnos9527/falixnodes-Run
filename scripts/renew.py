@@ -9,7 +9,7 @@ from seleniumbase import SB
 
 BASE = "https://client.falixnodes.net"
 LOGIN_URL = f"{BASE}/auth/login"
-TIMER_URL = os.getenv("FALIX_TIMER_URL") or f"{BASE}/timer?id=2845100"
+TIMER_URL = os.getenv("FALIX_TIMER_URL") or f"{BASE}/timer?id=3530628"
 COOKIE_FILE = "cookies/falix.json"
 
 EMAIL = os.getenv("FALIX_EMAIL", "")
